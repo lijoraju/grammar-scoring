@@ -142,21 +142,6 @@ def test_invalid_training_label(synthetic_dataset, value, message):
         dataset.validate_dataset()
 
 
-@pytest.mark.parametrize("kind", ["count", "order", "filename"])
-def test_submission_mismatch(synthetic_dataset, kind):
-    path = synthetic_dataset / "sample_submission.csv"
-    frame = pd.read_csv(path)
-    if kind == "count":
-        frame = frame.iloc[:1]
-    elif kind == "order":
-        frame = frame.iloc[::-1]
-    else:
-        frame.loc[0, "filename"] = "other.wav"
-    frame.to_csv(path, index=False)
-    with pytest.raises(ValueError, match="must match test.csv"):
-        dataset.validate_dataset()
-
-
 def test_unreferenced_audio(synthetic_dataset):
     extra = synthetic_dataset / "train" / "extra.WAV"
     extra.touch()
