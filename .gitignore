@@ -1,0 +1,60 @@
+# Python caches, builds, and test/tool output
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# Virtual and conda environments
+.venv/
+venv/
+env/
+.env/
+.conda/
+conda-env/
+
+# IDE and operating-system files
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+._*
+
+# Environment secrets and Kaggle credentials
+.env
+.env.*
+.kaggle/
+kaggle.json
+
+# Competition data and generated artifacts
+/data/
+/artifacts/
+*.wav
+*.WAV
+
+# Model checkpoints and weights
+*.ckpt
+*.pt
+*.pth
+*.pkl
+*.pickle
+*.joblib
+*.h5
+*.hdf5
+*.onnx
+*.safetensors
+*.weights
+*.weights.*
+checkpoint-*/
+
+# Notebook checkpoints
+.ipynb_checkpoints/
