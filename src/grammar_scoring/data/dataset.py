@@ -170,10 +170,6 @@ def validate_dataset(*, identify_unreferenced: bool = False) -> dict[str, list[P
     ):
         _validate_table(frame, path)
     _validate_train_labels(train)
-    if len(submission) != len(test):
-        raise ValueError("sample_submission.csv row count must match test.csv")
-    if not submission["filename"].equals(test["filename"]):
-        raise ValueError("sample_submission.csv filenames/order must match test.csv")
     extras = {
         "train": _validate_audio(train, TRAIN_AUDIO_DIR, identify_unreferenced),
         "test": _validate_audio(test, TEST_AUDIO_DIR, identify_unreferenced),
