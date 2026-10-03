@@ -53,14 +53,21 @@ def test_smoke_namespace_and_symlink_safety(tmp_path):
 
 @pytest.mark.parametrize("values", [(3, 2, 2), (4, 1, 1), (4, 2, 1), (4, 3, 3)])
 def test_actual_counts_reject_missing_updates(values):
-    counts = smoke.SmokeCounts(*values)
+    counts = smoke.SmokeCounts(
+        minibatches=values[0],
+        optimizer_steps=values[1],
+        scheduler_steps=values[2],
+        optimizer_update_attempts=2,
+    )
     with pytest.raises(RuntimeError):
         counts.validate()
 
 
 def test_observed_scheduler_excludes_constructor_steps():
     actual = Mock()
-    counts = smoke.SmokeCounts(minibatches=4, optimizer_steps=2)
+    counts = smoke.SmokeCounts(
+        minibatches=4, optimizer_steps=2, optimizer_update_attempts=2
+    )
     scheduler = smoke.ObservedScheduler(actual, counts)
     assert counts.scheduler_steps == 0
     scheduler.step()
@@ -99,6 +106,7 @@ def test_observed_loader_preserves_batches_and_counts_padding():
     assert list(loader)[0] is batches[0]
     assert asdict(counts) == {
         "minibatches": 1,
+        "optimizer_update_attempts": 0,
         "optimizer_steps": 0,
         "scheduler_steps": 0,
         "maximum_padded_length": 3,
@@ -297,3 +305,102 @@ def test_update_diagnostics_capture_attempt_without_changing_training(
     assert report["sentinel_parameter_changed"] == (scale_factor >= 1)
     assert scheduler.step.call_count == int(scale_factor >= 1)
     assert "AMP update diagnostics:" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("skips", [0, 1, 2, 5, 6, 7, 8])
+def test_bounded_smoke_uses_production_loop_with_simulated_skips(skips):
+    """CPU doubles verify control flow, not CUDA AMP numerical behavior."""
+    torch = pytest.importorskip("torch")
+    model = torch.nn.Linear(1, 1)
+    counts = smoke.SmokeCounts()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    scheduler_impl = Mock()
+    scheduler = smoke.ObservedScheduler(scheduler_impl, counts)
+    seen = []
+    clear_calls = []
+    original_zero_grad = optimizer.zero_grad
+
+    def clear(*args, **kwargs):
+        clear_calls.append(kwargs)
+        original_zero_grad(*args, **kwargs)
+
+    optimizer.zero_grad = clear
+    batches = [
+        {"input": torch.full((8, 1), float(i + 1)), "labels": torch.zeros(8, 1)}
+        for i in range(4)
+    ]
+
+    class Scaler:
+        value = 65536.0
+        attempts = 0
+
+        def scale(self, loss):
+            # Start of each attempt must have no stale gradients.
+            if len(seen) % 2 == 0:
+                assert all(p.grad is None for p in model.parameters())
+            seen.append(len(seen) % 4)
+            return loss * self.value
+
+        def get_scale(self):
+            return self.value
+
+        def unscale_(self, opt):
+            for parameter in model.parameters():
+                parameter.grad.div_(self.value)
+
+        def step(self, opt):
+            self.attempts += 1
+            if self.attempts > skips:
+                opt.step()
+
+        def update(self):
+            if self.attempts <= skips:
+                self.value *= 0.5
+
+    def stepped(*args):
+        counts.optimizer_steps += 1
+
+    handle = optimizer.register_step_post_hook(stepped)
+    frozen = smoke.BoundedSmokeLoader(batches, counts)
+    # Cache the actual order once; no new shuffle when it cycles.
+    assert all(a is b for a, b in zip(frozen.batches, batches, strict=True))
+
+    class CountBatches:
+        def __iter__(self):
+            for batch in frozen:
+                counts.minibatches += 1
+                expected = batches[len(consumed) % 4]
+                assert batch is expected
+                consumed.append(batch)
+                yield batch
+
+    consumed = []
+    try:
+        smoke.train_epoch(
+            model, CountBatches(), optimizer, scheduler, Scaler(), torch.device("cpu")
+        )
+    finally:
+        handle.remove()
+    expected_attempts = min(skips + 2, 8)
+    successes = min(2, 8 - skips)
+    assert counts.optimizer_update_attempts == expected_attempts
+    assert counts.optimizer_steps == successes
+    assert counts.scheduler_steps == successes
+    assert scheduler_impl.step.call_count == successes
+    assert len(consumed) == expected_attempts * 2
+    assert len(clear_calls) == expected_attempts + 1
+    assert all(call == {"set_to_none": True} for call in clear_calls)
+    assert all(p.grad is None for p in model.parameters())
+    if successes == 2:
+        counts.validate()
+    else:
+        with pytest.raises(RuntimeError, match="at most 8 attempts"):
+            counts.validate()
+
+
+def test_overflow_diagnostics_are_valid_json():
+    import json
+
+    report = {"norm": float("inf"), "nested": [float("nan"), 1.0]}
+    encoded = json.dumps(smoke._finite_json(report), allow_nan=False)
+    assert json.loads(encoded) == {"norm": "inf", "nested": ["nan", 1.0]}

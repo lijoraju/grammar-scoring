@@ -22,7 +22,6 @@ from grammar_scoring.experiments.deberta_finetuning import (
     _loader,
     create_scaler,
     load_inputs,
-    optimizer_step_count,
     predict,
     runtime_info,
     seed_everything,
@@ -40,6 +39,8 @@ if TYPE_CHECKING:
 NOTICE = "SMOKE TEST ONLY — NOT E005 RESULT"
 TRAIN_ROWS = 32
 VALID_ROWS = 16
+REQUIRED_SUCCESSFUL_UPDATES = 2
+MAX_UPDATE_ATTEMPTS = 8
 
 
 def smoke_subset(frame: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -72,23 +73,51 @@ class SmokeCounts:
     """Observed workload counts; scheduler construction is not an update."""
 
     minibatches: int = 0
+    optimizer_update_attempts: int = 0
     optimizer_steps: int = 0
     scheduler_steps: int = 0
     maximum_padded_length: int = 0
     padded_batches: int = 0
 
     def validate(self) -> None:
-        """Require four real mini-batches and two successful optimizer updates."""
-        expected = optimizer_step_count(TRAIN_ROWS // CONFIG.train_batch_size)
-        if self.minibatches != 4:
-            raise RuntimeError(f"Expected 4 mini-batches, observed {self.minibatches}")
-        if self.optimizer_steps != expected or expected != 2:
+        """Require two genuine updates within the bounded smoke workload."""
+        if not 2 <= self.optimizer_update_attempts <= MAX_UPDATE_ATTEMPTS:
+            raise RuntimeError("Smoke update attempts must be between 2 and 8")
+        if self.minibatches != self.optimizer_update_attempts * 2:
+            raise RuntimeError("Every smoke attempt requires 2 mini-batches")
+        if self.optimizer_steps != REQUIRED_SUCCESSFUL_UPDATES:
             raise RuntimeError(
-                f"Expected 2 successful optimizer steps, observed "
-                f"{self.optimizer_steps}; AMP may have skipped overflowed updates"
+                f"Expected 2 successful optimizer steps after at most 8 attempts, "
+                f"observed {self.optimizer_steps}"
             )
-        if self.scheduler_steps != self.optimizer_steps:
-            raise RuntimeError("Scheduler steps must equal actual optimizer steps")
+        if self.scheduler_steps != REQUIRED_SUCCESSFUL_UPDATES:
+            raise RuntimeError("Scheduler steps must equal actual optimizer steps (2)")
+
+
+class BoundedSmokeLoader:
+    """Repeat a fixed subset ordering until two updates or eight attempts.
+
+    Production requests each new group after scheduler stepping and gradient
+    clearing, allowing this loader to stop without changing the training loop.
+    """
+
+    def __init__(self, loader: DataLoader, counts: SmokeCounts) -> None:
+        """Freeze one seeded traversal of the same 32 training rows."""
+        self.batches = list(loader)
+        self.counts = counts
+        if len(self.batches) != 4 or any(
+            len(batch["labels"]) != CONFIG.train_batch_size for batch in self.batches
+        ):
+            raise RuntimeError("Smoke requires four batches of eight rows")
+
+    def __iter__(self) -> Iterator[dict[str, Tensor]]:
+        """Yield two unchanged microbatches per bounded update attempt."""
+        for attempt in range(MAX_UPDATE_ATTEMPTS):
+            if self.counts.optimizer_steps >= REQUIRED_SUCCESSFUL_UPDATES:
+                return
+            self.counts.optimizer_update_attempts += 1
+            start = (attempt * CONFIG.gradient_accumulation_steps) % len(self.batches)
+            yield from self.batches[start : start + CONFIG.gradient_accumulation_steps]
 
 
 class ObservedLoader:
@@ -381,7 +410,7 @@ def gpu_memory(device: TorchDevice) -> dict[str, int]:
 
 
 def run_smoke(transcript_dir: Path, fold_path: Path, output_root: Path) -> Path:
-    """Run one real GPU smoke epoch without invoking canonical fold orchestration."""
+    """Run bounded GPU smoke updates without canonical fold orchestration."""
     import torch
 
     print(NOTICE, flush=True)
@@ -416,7 +445,7 @@ def run_smoke(transcript_dir: Path, fold_path: Path, output_root: Path) -> Path:
     train_loader, _ = _loader(training, tokenizer, shuffle=True)
     valid_loader, _ = _loader(validation, tokenizer, shuffle=False)
     counts = SmokeCounts()
-    observed_train = ObservedLoader(train_loader, counts)
+    observed_train = ObservedLoader(BoundedSmokeLoader(train_loader, counts), counts)
     # Prefer an actually padded batch across the selected train/validation rows.
     valid_batches = list(valid_loader)
     inspection_loader, _ = _loader(
@@ -431,9 +460,10 @@ def run_smoke(transcript_dir: Path, fold_path: Path, output_root: Path) -> Path:
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=CONFIG.learning_rate, weight_decay=CONFIG.weight_decay
     )
-    expected_steps = optimizer_step_count(len(train_loader))
+    expected_steps = REQUIRED_SUCCESSFUL_UPDATES
     schedule = {
-        "smoke_epochs": 1,
+        "required_successful_updates": REQUIRED_SUCCESSFUL_UPDATES,
+        "max_update_attempts": MAX_UPDATE_ATTEMPTS,
         "total_optimizer_steps": expected_steps,
         "warmup_steps": math.ceil(expected_steps * CONFIG.warmup_ratio),
     }
@@ -449,6 +479,7 @@ def run_smoke(transcript_dir: Path, fold_path: Path, output_root: Path) -> Path:
     if not scaler.is_enabled():
         raise RuntimeError("CUDA FP16 AMP scaler is not enabled")
 
+    initial_scale = scaler.get_scale()
     head_weight = model.head.weight
 
     def stepped(actual_optimizer: Optimizer, args: tuple, kwargs: dict) -> None:
@@ -485,6 +516,13 @@ def run_smoke(transcript_dir: Path, fold_path: Path, output_root: Path) -> Path:
             report["optimizer_step_hook_fired"] = (
                 counts.optimizer_steps > report["optimizer_hook_count_before"]
             )
+        report["update_index"] = counts.optimizer_update_attempts
+        if stage == "after_step":
+            if (
+                report["optimizer_step_hook_fired"]
+                != report["update_not_skipped_by_scale"]
+            ):
+                raise RuntimeError("Optimizer hook and AMP scale disagree on success")
         update_diagnostics(stage, observed_model, report)
 
     def observe_dtypes(stage: str, observed_model: nn.Module, loss: Tensor) -> None:
@@ -507,7 +545,42 @@ def run_smoke(transcript_dir: Path, fold_path: Path, output_root: Path) -> Path:
     finally:
         handle.remove()
         forward_handle.remove()
+    successes = [
+        r for r in update_diagnostics.reports if r["optimizer_step_hook_fired"]
+    ]
+    amp_summary = {
+        "total_update_attempts": counts.optimizer_update_attempts,
+        "skipped_amp_updates": counts.optimizer_update_attempts
+        - counts.optimizer_steps,
+        "successful_optimizer_updates": counts.optimizer_steps,
+        "scheduler_steps": counts.scheduler_steps,
+        "initial_grad_scaler_scale": initial_scale,
+        "final_grad_scaler_scale": scaler.get_scale(),
+        "scale_sequence": [initial_scale]
+        + [r["scale_after_update"] for r in update_diagnostics.reports],
+        "first_successful_update_attempt": (
+            successes[0]["update_index"] if successes else None
+        ),
+        "successful_update_finite_status": [
+            {
+                "attempt": r["update_index"],
+                "after_unscale": r["after_unscale"]["all_finite"],
+                "after_clip": r["after_clip"]["all_finite"],
+                "gradient_norm": r["gradient_norm_is_finite"],
+            }
+            for r in successes
+        ],
+    }
+    print("AMP startup summary:", json.dumps(amp_summary), flush=True)
     counts.validate()
+    if any(
+        not all(
+            status[key] is True
+            for key in ("after_unscale", "after_clip", "gradient_norm")
+        )
+        for status in amp_summary["successful_update_finite_status"]
+    ):
+        raise RuntimeError("Successful updates require finite gradients and norms")
     if not math.isfinite(loss):
         raise RuntimeError("Nonfinite smoke training loss")
     before = predict(model, valid_loader, device)
@@ -548,6 +621,7 @@ def run_smoke(transcript_dir: Path, fold_path: Path, output_root: Path) -> Path:
         "real_tensor_shapes": shapes,
         "training_dtype_diagnostics": dtype_reports,
         "amp_update_diagnostics": update_diagnostics.reports,
+        "amp_startup_summary": amp_summary,
         "train_loss": loss,
         "smoke_only_metrics": finite_metrics,
         "memory_after_training": memory_training,
@@ -559,7 +633,8 @@ def run_smoke(transcript_dir: Path, fold_path: Path, output_root: Path) -> Path:
         "model_revision": getattr(restored.backbone.config, "_commit_hash", None),
     }
     (directory / "smoke_summary.json").write_text(
-        json.dumps(report, indent=2, allow_nan=False) + "\n", encoding="utf-8"
+        json.dumps(_finite_json(report), indent=2, allow_nan=False) + "\n",
+        encoding="utf-8",
     )
     print(NOTICE, json.dumps(report, indent=2), flush=True)
     checks = [
@@ -586,6 +661,17 @@ def run_smoke(transcript_dir: Path, fold_path: Path, output_root: Path) -> Path:
         )
     print(NOTICE, "PASS", flush=True)
     return directory
+
+
+def _finite_json(value: object) -> object:
+    """Encode legitimate overflow diagnostics as valid JSON string values."""
+    if isinstance(value, float) and not math.isfinite(value):
+        return str(value)
+    if isinstance(value, dict):
+        return {key: _finite_json(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_finite_json(item) for item in value]
+    return value
 
 
 def main() -> None:

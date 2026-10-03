@@ -23,11 +23,29 @@ python scripts/smoke_test_deberta_finetuning.py \
 The deterministic subset is the first 32 canonical rows where frozen fold is
 not 0 and the first 16 where fold is 0. All selected filenames are printed.
 Raw text, tokenizer settings, regression architecture and optimization settings
-come from production E005. The smoke trains exactly one epoch: four mini-batches
-of eight examples, two accumulation groups, and two expected successful
-optimizer/scheduler updates. The linear scheduler uses the smoke workload's two
-steps and `ceil(2 * 0.10) = 1` warmup step. This is not E005's five-epoch schedule.
-If AMP skips an update, the expected-count assertion fails explicitly.
+come from production E005. The smoke stops immediately after two genuinely
+successful optimizer updates, or fails after eight attempted updates. Each
+attempt uses two microbatches of eight rows with accumulation two. One seeded
+shuffle of the same 32 training rows is frozen into four batches; attempts use
+batches 1–2, then 3–4, then cycle through that identical ordering as needed.
+No additional rows are selected.
+
+Normal GradScaler startup overflow may skip early attempts and reduce the scale.
+The scaler's initial scale and growth/backoff settings remain unchanged, and no
+successful scale is prescribed. Skips do not count as optimizer updates or
+advance the scheduler. The unchanged production loop clears gradients with
+`zero_grad(set_to_none=True)` after every attempted update, including skips.
+The linear scheduler represents two successful updates with
+`ceil(2 * 0.10) = 1` warmup step; exactly two scheduler steps are required.
+This smoke schedule does not change E005's five-epoch schedule.
+
+AMP diagnostics include each attempt's losses, gradient finite status, optimizer
+hook and sentinel checks. The final startup summary reports attempts, skips,
+successful updates, scheduler steps, initial/final scale, the complete scale
+sequence, the first successful attempt and gradient finite status at successful
+updates. Legitimate nonfinite overflow diagnostic numbers are stored as strings
+in strict JSON. The startup summary is also printed before bounded-failure
+assertions.
 
 The runner checks CUDA FP16 training predictions, finite nonzero unscaled head
 gradients, finite loss and 16 scalar validation predictions. It inspects actual
