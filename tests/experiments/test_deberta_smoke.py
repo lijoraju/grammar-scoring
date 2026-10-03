@@ -214,3 +214,86 @@ def test_dtype_diagnostics_before_backward_and_before_unscale():
     assert after["gradient_dtypes"] == ["torch.float32"]
     assert after["head_gradient_dtype"] == "torch.float32"
     assert after["backbone_gradient_dtype"] == "torch.float32"
+
+
+def test_gradient_diagnostics_identify_nonfinite_components():
+    torch = pytest.importorskip("torch")
+    model = torch.nn.Module()
+    model.backbone = torch.nn.Linear(2, 1)
+    model.head = torch.nn.Linear(1, 1)
+    model.backbone.weight.grad = torch.tensor([[float("inf"), -float("inf")]])
+    model.head.bias.grad = torch.tensor([float("nan")])
+    before = model.backbone.weight.grad.clone()
+    report = smoke.gradient_diagnostics(model)
+    assert report["all_finite"] is False
+    assert report["positive_inf"] == ["backbone.weight"]
+    assert report["negative_inf"] == ["backbone.weight"]
+    assert report["nan"] == ["head.bias"]
+    assert torch.equal(before, model.backbone.weight.grad)
+
+
+@pytest.mark.parametrize("scale_factor", [0.5, 1.0, 2.0])
+def test_update_diagnostics_capture_attempt_without_changing_training(
+    scale_factor, capsys
+):
+    torch = pytest.importorskip("torch")
+    from grammar_scoring.experiments import deberta_finetuning as e005
+
+    model = torch.nn.Linear(1, 1)
+    with torch.no_grad():
+        model.weight.fill_(0.5)
+        model.bias.fill_(0.5)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    scheduler = Mock()
+
+    class Scaler:
+        scale_value = 8.0
+
+        def scale(self, loss):
+            return loss * self.scale_value
+
+        def get_scale(self):
+            return self.scale_value
+
+        def unscale_(self, opt):
+            for group in opt.param_groups:
+                for parameter in group["params"]:
+                    parameter.grad.div_(self.scale_value)
+
+        def step(self, opt):
+            if scale_factor >= 1:
+                return opt.step()
+            return None
+
+        def update(self):
+            self.scale_value *= scale_factor
+
+    observer = smoke.SmokeUpdateDiagnostics()
+    e005.train_epoch(
+        model,
+        [{"input": torch.ones(1, 1), "labels": torch.zeros(1, 1)}],
+        optimizer,
+        scheduler,
+        Scaler(),
+        torch.device("cpu"),
+        update_observer=observer,
+    )
+    report = observer.reports[0]
+    assert report["update_index"] == 1
+    assert report["microbatches"][0]["raw_loss"] == 1.0
+    assert report["microbatches"][0]["scale_before_backward"] == 8.0
+    assert report["before_unscale"]["maximum_absolute_gradient"] == 16.0
+    assert report["after_unscale"]["maximum_absolute_gradient"] == 2.0
+    assert report["after_unscale"]["all_finite"] is True
+    assert report["unclipped_gradient_norm"] == pytest.approx(8**0.5)
+    assert report["gradient_norm_is_finite"] is True
+    assert report["after_clip"]["maximum_absolute_gradient"] < 2
+    assert report["scale_before_step"] == 8
+    assert report["scale_after_update"] == 8 * scale_factor
+    assert (
+        report["scale_change"]
+        == {0.5: "decreased", 1.0: "equal", 2.0: "increased"}[scale_factor]
+    )
+    assert report["sentinel_parameter_changed"] == (scale_factor >= 1)
+    assert scheduler.step.call_count == int(scale_factor >= 1)
+    assert "AMP update diagnostics:" in capsys.readouterr().out

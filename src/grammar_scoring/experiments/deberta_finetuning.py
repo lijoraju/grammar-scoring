@@ -212,13 +212,15 @@ def train_epoch(
     device: TorchDevice,
     *,
     dtype_observer: Callable[[str, nn.Module, Tensor], None] | None = None,
+    update_observer: Callable[[str, nn.Module, dict[str, Any]], None] | None = None,
 ) -> float:
     """Train once and return sample-weighted MSE observed before each update.
 
     Accumulated loss is weighted by sample count within each group, including
     the final partial group. Every group's gradients are stepped, clipped after
     AMP unscale, and cleared. Scheduler advances only on successful AMP updates.
-    An optional observer reports dtypes before backward and before AMP unscale.
+    Optional observers report dtypes and smoke-only update diagnostics.
+    Update observers must inspect tensors without changing training state.
     """
     import torch
 
@@ -227,7 +229,13 @@ def train_epoch(
     weighted_loss = 0.0
     samples = 0
     iterator = iter(loader)
+    update_index = 0
     while group := list(_take(iterator, CONFIG.gradient_accumulation_steps)):
+        update_index += 1
+        update_report: dict[str, Any] = {
+            "update_index": update_index,
+            "microbatches": [],
+        }
         group_samples = sum(len(batch["labels"]) for batch in group)
         for batch in group:
             labels = batch["labels"].to(device)
@@ -242,15 +250,50 @@ def train_epoch(
             samples += count
             if dtype_observer is not None:
                 dtype_observer("before_backward", model, loss)
+            if update_observer is not None:
+                update_report["microbatches"].append(
+                    {
+                        "raw_loss": loss.detach().item(),
+                        "scale_before_backward": scaler.get_scale(),
+                        "loss_weight": count / group_samples,
+                    }
+                )
             scaler.scale(loss * count / group_samples).backward()
+            if update_observer is not None:
+                update_observer("after_backward", model, update_report)
         if dtype_observer is not None:
             dtype_observer("before_unscale", model, loss)
+        if update_observer is not None:
+            update_observer("before_unscale", model, update_report)
         scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), CONFIG.max_grad_norm)
+        if update_observer is not None:
+            update_observer("after_unscale", model, update_report)
+        grad_norm = torch.nn.utils.clip_grad_norm_(
+            model.parameters(), CONFIG.max_grad_norm
+        )
+        if update_observer is not None:
+            update_report["unclipped_gradient_norm"] = float(grad_norm)
+            update_report["gradient_norm_is_finite"] = math.isfinite(float(grad_norm))
+            update_observer("after_clip", model, update_report)
         old_scale = scaler.get_scale()
+        if update_observer is not None:
+            update_report["scale_before_step"] = old_scale
+            update_observer("before_step", model, update_report)
         scaler.step(optimizer)
         scaler.update()
-        if scaler.get_scale() >= old_scale:
+        new_scale = scaler.get_scale()
+        if update_observer is not None:
+            update_report["scale_after_update"] = new_scale
+            update_report["scale_change"] = (
+                "decreased"
+                if new_scale < old_scale
+                else "increased"
+                if new_scale > old_scale
+                else "equal"
+            )
+            update_report["update_not_skipped_by_scale"] = new_scale >= old_scale
+            update_observer("after_step", model, update_report)
+        if new_scale >= old_scale:
             scheduler.step()
         optimizer.zero_grad(set_to_none=True)
     return weighted_loss / samples

@@ -229,6 +229,98 @@ def inspect_forward(
             handle.remove()
 
 
+def gradient_diagnostics(model: nn.Module) -> dict[str, Any]:
+    """Summarize gradients and name tensors containing nonfinite values.
+
+    Args:
+        model: Model whose current gradients are inspected without mutation.
+
+    Returns:
+        Finite status, maximum magnitude, and NaN/Inf tensor names. Names
+        distinguish backbone and head; no gradient tensors are printed.
+    """
+    import torch
+
+    names: dict[str, list[str]] = {"nan": [], "positive_inf": [], "negative_inf": []}
+    maxima = []
+    norms = []
+    tensor_count = 0
+    for name, parameter in model.named_parameters():
+        if parameter.grad is None:
+            continue
+        gradient = parameter.grad.detach()
+        tensor_count += 1
+        for key, predicate in (
+            ("nan", torch.isnan),
+            ("positive_inf", torch.isposinf),
+            ("negative_inf", torch.isneginf),
+        ):
+            if predicate(gradient).any().item():
+                names[key].append(name)
+        maxima.append(float(gradient.abs().max()))
+        norms.append(torch.linalg.vector_norm(gradient))
+    return {
+        "total_gradient_norm": (
+            float(torch.linalg.vector_norm(torch.stack(norms))) if norms else None
+        ),
+        "gradient_tensor_count": tensor_count,
+        "all_finite": not any(names.values()) if tensor_count else None,
+        "maximum_absolute_gradient": (
+            float("nan")
+            if any(math.isnan(value) for value in maxima)
+            else max(maxima, default=None)
+        ),
+        **names,
+    }
+
+
+class SmokeUpdateDiagnostics:
+    """Observe update attempts, copying only one small sentinel parameter."""
+
+    def __init__(self) -> None:
+        """Initialize smoke-only reports and sentinel storage."""
+        self.reports: list[dict[str, Any]] = []
+        self._sentinel: Tensor | None = None
+        self._before: Tensor | None = None
+
+    def __call__(self, stage: str, model: nn.Module, report: dict[str, Any]) -> None:
+        """Collect stage diagnostics and emit each completed attempt immediately.
+
+        Args:
+            stage: Update stage provided by the production training loop.
+            model: Training model inspected without modifying its state.
+            report: Current accumulation group's mutable diagnostic report.
+        """
+        import torch
+
+        if stage == "after_backward":
+            report["microbatches"][-1]["scaled_gradients_after_backward"] = (
+                gradient_diagnostics(model)
+            )
+        elif stage in {"before_unscale", "after_unscale", "after_clip"}:
+            report[stage] = gradient_diagnostics(model)
+        elif stage == "before_step":
+            candidates = [
+                (name, parameter)
+                for name, parameter in model.named_parameters()
+                if parameter.requires_grad and parameter.grad is not None
+            ]
+            # Prefer the small regression head over a backbone tensor.
+            name, parameter = min(candidates, key=lambda item: item[1].numel())
+            report["sentinel_parameter"] = name
+            self._sentinel = parameter
+            self._before = parameter.detach().clone()
+        elif stage == "after_step":
+            assert self._sentinel is not None and self._before is not None
+            report["sentinel_parameter_changed"] = not torch.equal(
+                self._before, self._sentinel.detach()
+            )
+            self._before = None
+            self._sentinel = None
+            self.reports.append(report)
+            print("AMP update diagnostics:", json.dumps(report), flush=True)
+
+
 def dtype_diagnostics(stage: str, model: nn.Module, loss: Tensor) -> dict[str, Any]:
     """Report storage/loss or accumulated gradient dtypes without tensor values.
 
@@ -381,6 +473,19 @@ def run_smoke(transcript_dir: Path, fold_path: Path, output_root: Path) -> Path:
     handle = optimizer.register_step_post_hook(stepped)
     forward_handle = model.register_forward_hook(fp16_forward)
     dtype_reports = []
+    update_diagnostics = SmokeUpdateDiagnostics()
+
+    def observe_update(
+        stage: str, observed_model: nn.Module, report: dict[str, Any]
+    ) -> None:
+        if stage == "before_step":
+            report["optimizer_hook_count_before"] = counts.optimizer_steps
+        elif stage == "after_step":
+            report["optimizer_hook_count_after"] = counts.optimizer_steps
+            report["optimizer_step_hook_fired"] = (
+                counts.optimizer_steps > report["optimizer_hook_count_before"]
+            )
+        update_diagnostics(stage, observed_model, report)
 
     def observe_dtypes(stage: str, observed_model: nn.Module, loss: Tensor) -> None:
         report = dtype_diagnostics(stage, observed_model, loss)
@@ -397,6 +502,7 @@ def run_smoke(transcript_dir: Path, fold_path: Path, output_root: Path) -> Path:
             scaler,
             device,
             dtype_observer=observe_dtypes,
+            update_observer=observe_update,
         )
     finally:
         handle.remove()
@@ -441,6 +547,7 @@ def run_smoke(transcript_dir: Path, fold_path: Path, output_root: Path) -> Path:
         "tokenization": token_diagnostics,
         "real_tensor_shapes": shapes,
         "training_dtype_diagnostics": dtype_reports,
+        "amp_update_diagnostics": update_diagnostics.reports,
         "train_loss": loss,
         "smoke_only_metrics": finite_metrics,
         "memory_after_training": memory_training,

@@ -431,11 +431,12 @@ def test_predict_raw_unclipped_and_nonfinite_rejected():
         e005.predict(Model(), loader, torch.device("cpu"))
 
 
-@pytest.mark.parametrize("skipped", [False, True])
-def test_amp_update_order_and_dtype_observer(monkeypatch, skipped):
+@pytest.mark.parametrize("scale_factor", [0.5, 1.0, 2.0])
+def test_amp_update_order_and_dtype_observer(monkeypatch, scale_factor):
     torch = pytest.importorskip("torch")
     model = torch.nn.Linear(1, 1)
-    optimizer = torch.optim.SGD(model.parameters(), lr=0)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    before = model.weight.detach().clone()
     events = []
     scale = [8.0]
 
@@ -454,14 +455,20 @@ def test_amp_update_order_and_dtype_observer(monkeypatch, skipped):
 
     def update():
         events.append("update")
-        if skipped:
-            scale[0] /= 2
+        scale[0] *= scale_factor
 
     scaler = Mock()
     scaler.scale.side_effect = ScaledLoss
     scaler.unscale_.side_effect = unscale
     scaler.get_scale.side_effect = lambda: scale[0]
-    scaler.step.side_effect = lambda opt: events.append("step")
+
+    def step(opt):
+        events.append("step")
+        if scale_factor >= 1:
+            assert opt.step() is None
+        return None
+
+    scaler.step.side_effect = step
     scaler.update.side_effect = update
     scheduler = Mock()
     scheduler.step.side_effect = lambda: events.append("scheduler")
@@ -494,7 +501,9 @@ def test_amp_update_order_and_dtype_observer(monkeypatch, skipped):
         "step",
         "update",
     ]
-    if not skipped:
+    if scale_factor >= 1:
         expected.append("scheduler")
+    assert scheduler.step.call_count == int(scale_factor >= 1)
+    assert (not torch.equal(before, model.weight)) == (scale_factor >= 1)
     assert events == expected
     assert model.weight.grad is None
