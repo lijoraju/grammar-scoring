@@ -429,3 +429,72 @@ def test_predict_raw_unclipped_and_nonfinite_rejected():
     loader[0]["input_ids"][0] = float("nan")
     with pytest.raises(RuntimeError, match="Nonfinite"):
         e005.predict(Model(), loader, torch.device("cpu"))
+
+
+@pytest.mark.parametrize("skipped", [False, True])
+def test_amp_update_order_and_dtype_observer(monkeypatch, skipped):
+    torch = pytest.importorskip("torch")
+    model = torch.nn.Linear(1, 1)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0)
+    events = []
+    scale = [8.0]
+
+    class ScaledLoss:
+        def __init__(self, loss):
+            self.loss = loss
+
+        def backward(self):
+            events.append("backward")
+            self.loss.backward()
+
+    def unscale(actual_optimizer):
+        assert actual_optimizer is optimizer
+        assert model.weight.grad is not None
+        events.append("unscale")
+
+    def update():
+        events.append("update")
+        if skipped:
+            scale[0] /= 2
+
+    scaler = Mock()
+    scaler.scale.side_effect = ScaledLoss
+    scaler.unscale_.side_effect = unscale
+    scaler.get_scale.side_effect = lambda: scale[0]
+    scaler.step.side_effect = lambda opt: events.append("step")
+    scaler.update.side_effect = update
+    scheduler = Mock()
+    scheduler.step.side_effect = lambda: events.append("scheduler")
+    monkeypatch.setattr(
+        torch.nn.utils, "clip_grad_norm_", lambda *args: events.append("clip")
+    )
+
+    def observe(stage, observed_model, loss):
+        assert observed_model is model
+        assert loss.dtype == torch.float32
+        if stage == "before_unscale":
+            assert model.weight.grad.dtype == torch.float32
+        events.append(stage)
+
+    e005.train_epoch(
+        model,
+        [{"input": torch.ones(1, 1), "labels": torch.ones(1, 1)}],
+        optimizer,
+        scheduler,
+        scaler,
+        torch.device("cpu"),
+        dtype_observer=observe,
+    )
+    expected = [
+        "before_backward",
+        "backward",
+        "before_unscale",
+        "unscale",
+        "clip",
+        "step",
+        "update",
+    ]
+    if not skipped:
+        expected.append("scheduler")
+    assert events == expected
+    assert model.weight.grad is None

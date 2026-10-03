@@ -186,3 +186,31 @@ def test_forward_inspection_failure_removes_hooks(monkeypatch):
         smoke.inspect_forward(model, batch, torch.device("cpu"))
     assert not model.backbone._forward_hooks
     assert not model.head._forward_pre_hooks
+
+
+def test_dtype_diagnostics_before_backward_and_before_unscale():
+    torch = pytest.importorskip("torch")
+    from grammar_scoring.models.deberta_regressor import DebertaRegressor
+
+    backbone = torch.nn.Linear(2, 2)
+    backbone.config = SimpleNamespace(hidden_size=2)
+    model = DebertaRegressor(backbone)
+    loss = model.head(model.backbone(torch.ones(1, 2))).square().mean()
+    before = smoke.dtype_diagnostics("before_backward", model, loss)
+    assert before["trainable_parameter_dtypes"] == ["torch.float32"]
+    for key in (
+        "head_weight_dtype",
+        "head_bias_dtype",
+        "backbone_parameter_dtype",
+        "loss_dtype",
+    ):
+        assert before[key] == "torch.float32"
+    assert (
+        smoke.dtype_diagnostics("before_unscale", model, loss)["head_gradient_dtype"]
+        is None
+    )
+    loss.backward()
+    after = smoke.dtype_diagnostics("before_unscale", model, loss)
+    assert after["gradient_dtypes"] == ["torch.float32"]
+    assert after["head_gradient_dtype"] == "torch.float32"
+    assert after["backbone_gradient_dtype"] == "torch.float32"

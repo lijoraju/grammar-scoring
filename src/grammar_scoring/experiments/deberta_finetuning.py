@@ -17,8 +17,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from torch import Tensor, nn
     from torch import device as TorchDevice
-    from torch import nn
     from torch.amp import GradScaler
     from torch.optim import Optimizer
     from torch.optim.lr_scheduler import LRScheduler
@@ -210,12 +210,15 @@ def train_epoch(
     scheduler: LRScheduler,
     scaler: GradScaler,
     device: TorchDevice,
+    *,
+    dtype_observer: Callable[[str, nn.Module, Tensor], None] | None = None,
 ) -> float:
     """Train once and return sample-weighted MSE observed before each update.
 
     Accumulated loss is weighted by sample count within each group, including
     the final partial group. Every group's gradients are stepped, clipped after
     AMP unscale, and cleared. Scheduler advances only on successful AMP updates.
+    An optional observer reports dtypes before backward and before AMP unscale.
     """
     import torch
 
@@ -237,7 +240,11 @@ def train_epoch(
             count = len(labels)
             weighted_loss += loss.detach().item() * count
             samples += count
+            if dtype_observer is not None:
+                dtype_observer("before_backward", model, loss)
             scaler.scale(loss * count / group_samples).backward()
+        if dtype_observer is not None:
+            dtype_observer("before_unscale", model, loss)
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), CONFIG.max_grad_norm)
         old_scale = scaler.get_scale()

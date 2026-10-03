@@ -47,3 +47,29 @@ def test_regression_head_and_trainable_backbone():
     torch.testing.assert_close(result, torch.tensor([4.0, 4.0]))
     result.sum().backward()
     assert model.backbone.weight.grad is not None
+
+
+def test_pretrained_loading_keeps_fp32_storage_with_amp(monkeypatch):
+    import sys
+    from unittest.mock import Mock
+
+    def load_backbone(name, **kwargs):
+        # Model Transformers v5's inferred FP16 checkpoint storage offline.
+        backbone = torch.nn.Linear(2, 2).to(dtype=kwargs.get("dtype", torch.float16))
+        backbone.config = SimpleNamespace(hidden_size=2)
+        return backbone
+
+    load = Mock(side_effect=load_backbone)
+    monkeypatch.setitem(
+        sys.modules,
+        "transformers",
+        SimpleNamespace(AutoModel=SimpleNamespace(from_pretrained=load)),
+    )
+    model = DebertaRegressor.from_pretrained().to(torch.device("cpu"))
+    load.assert_called_once_with("microsoft/deberta-v3-base", dtype=torch.float32)
+    assert {p.dtype for p in model.parameters()} == {torch.float32}
+    # CPU autocast checks storage preservation only, not real CUDA FP16 AMP.
+    with torch.amp.autocast("cpu", dtype=torch.bfloat16):
+        model.head(torch.ones(1, 2)).float().sum().backward()
+    assert {p.dtype for p in model.parameters()} == {torch.float32}
+    assert model.head.weight.grad.dtype == torch.float32

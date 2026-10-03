@@ -4,7 +4,7 @@ PyTorch is a runtime dependency for this module; Transformers is imported only
 when constructing the real pretrained backbone, allowing offline fake models.
 """
 
-from torch import Tensor, nn
+from torch import Tensor, float32, nn
 
 MODEL_NAME = "microsoft/deberta-v3-base"
 
@@ -40,7 +40,9 @@ class DebertaRegressor(nn.Module):
         """Initialize from original pretrained weights, never a fold checkpoint."""
         from transformers import AutoModel
 
-        return cls(AutoModel.from_pretrained(MODEL_NAME))
+        # Transformers v5 infers storage dtype by default. AMP needs FP32
+        # trainable weights; autocast alone controls forward compute precision.
+        return cls(AutoModel.from_pretrained(MODEL_NAME, dtype=float32))
 
     def forward(self, **inputs: Tensor) -> Tensor:
         """Return raw continuous predictions of shape [batch]."""

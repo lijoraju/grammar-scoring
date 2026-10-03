@@ -229,6 +229,46 @@ def inspect_forward(
             handle.remove()
 
 
+def dtype_diagnostics(stage: str, model: nn.Module, loss: Tensor) -> dict[str, Any]:
+    """Report storage/loss or accumulated gradient dtypes without tensor values.
+
+    Args:
+        stage: Either before_backward or before_unscale.
+        model: Production regressor with a backbone and linear head.
+        loss: Unscaled training loss.
+
+    Returns:
+        JSON-compatible dtype names for the requested stage.
+    """
+    parameters = [p for p in model.parameters() if p.requires_grad]
+    backbone = next(p for p in model.backbone.parameters() if p.requires_grad)
+    if stage == "before_backward":
+        return {
+            "stage": stage,
+            "trainable_parameter_dtypes": sorted({str(p.dtype) for p in parameters}),
+            "head_weight_dtype": str(model.head.weight.dtype),
+            "head_bias_dtype": str(model.head.bias.dtype),
+            "backbone_parameter_dtype": str(backbone.dtype),
+            "loss_dtype": str(loss.dtype),
+        }
+    if stage != "before_unscale":
+        raise ValueError(f"Unknown dtype diagnostic stage: {stage}")
+    return {
+        "stage": stage,
+        "gradient_dtypes": sorted(
+            {str(p.grad.dtype) for p in parameters if p.grad is not None}
+        ),
+        "head_gradient_dtype": (
+            str(model.head.weight.grad.dtype)
+            if model.head.weight.grad is not None
+            else None
+        ),
+        "backbone_gradient_dtype": (
+            str(backbone.grad.dtype) if backbone.grad is not None else None
+        ),
+    }
+
+
 def gpu_memory(device: TorchDevice) -> dict[str, int]:
     """Read allocated, reserved, peak allocated and total CUDA capacity in bytes."""
     import torch
@@ -340,9 +380,24 @@ def run_smoke(transcript_dir: Path, fold_path: Path, output_root: Path) -> Path:
 
     handle = optimizer.register_step_post_hook(stepped)
     forward_handle = model.register_forward_hook(fp16_forward)
+    dtype_reports = []
+
+    def observe_dtypes(stage: str, observed_model: nn.Module, loss: Tensor) -> None:
+        report = dtype_diagnostics(stage, observed_model, loss)
+        dtype_reports.append(report)
+        print("Training dtype diagnostics:", json.dumps(report), flush=True)
+
     torch.cuda.reset_peak_memory_stats(device)
     try:
-        loss = train_epoch(model, observed_train, optimizer, scheduler, scaler, device)
+        loss = train_epoch(
+            model,
+            observed_train,
+            optimizer,
+            scheduler,
+            scaler,
+            device,
+            dtype_observer=observe_dtypes,
+        )
     finally:
         handle.remove()
         forward_handle.remove()
@@ -385,6 +440,7 @@ def run_smoke(transcript_dir: Path, fold_path: Path, output_root: Path) -> Path:
         "counts": asdict(counts),
         "tokenization": token_diagnostics,
         "real_tensor_shapes": shapes,
+        "training_dtype_diagnostics": dtype_reports,
         "train_loss": loss,
         "smoke_only_metrics": finite_metrics,
         "memory_after_training": memory_training,
