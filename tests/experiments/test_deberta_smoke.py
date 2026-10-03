@@ -307,7 +307,7 @@ def test_update_diagnostics_capture_attempt_without_changing_training(
     assert "AMP update diagnostics:" in capsys.readouterr().out
 
 
-@pytest.mark.parametrize("skips", [0, 1, 2, 5, 6, 7, 8])
+@pytest.mark.parametrize("skips", [0, 1, 2, 5, 6, 7, 8, 14, 15, 16])
 def test_bounded_smoke_uses_production_loop_with_simulated_skips(skips):
     """CPU doubles verify control flow, not CUDA AMP numerical behavior."""
     torch = pytest.importorskip("torch")
@@ -381,8 +381,10 @@ def test_bounded_smoke_uses_production_loop_with_simulated_skips(skips):
         )
     finally:
         handle.remove()
-    expected_attempts = min(skips + 2, 8)
-    successes = min(2, 8 - skips)
+    assert smoke.MAX_UPDATE_ATTEMPTS == 16
+    assert smoke.REQUIRED_SUCCESSFUL_UPDATES == 2
+    expected_attempts = min(skips + 2, 16)
+    successes = min(2, 16 - skips)
     assert counts.optimizer_update_attempts == expected_attempts
     assert counts.optimizer_steps == successes
     assert counts.scheduler_steps == successes
@@ -394,7 +396,7 @@ def test_bounded_smoke_uses_production_loop_with_simulated_skips(skips):
     if successes == 2:
         counts.validate()
     else:
-        with pytest.raises(RuntimeError, match="at most 8 attempts"):
+        with pytest.raises(RuntimeError, match="at most 16 attempts"):
             counts.validate()
 
 

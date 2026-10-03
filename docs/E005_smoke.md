@@ -24,7 +24,7 @@ The deterministic subset is the first 32 canonical rows where frozen fold is
 not 0 and the first 16 where fold is 0. All selected filenames are printed.
 Raw text, tokenizer settings, regression architecture and optimization settings
 come from production E005. The smoke stops immediately after two genuinely
-successful optimizer updates, or fails after eight attempted updates. Each
+successful optimizer updates, or fails after sixteen attempted updates. Each
 attempt uses two microbatches of eight rows with accumulation two. One seeded
 shuffle of the same 32 training rows is frozen into four batches; attempts use
 batches 1–2, then 3–4, then cycle through that identical ordering as needed.

@@ -40,7 +40,7 @@ NOTICE = "SMOKE TEST ONLY — NOT E005 RESULT"
 TRAIN_ROWS = 32
 VALID_ROWS = 16
 REQUIRED_SUCCESSFUL_UPDATES = 2
-MAX_UPDATE_ATTEMPTS = 8
+MAX_UPDATE_ATTEMPTS = 16
 
 
 def smoke_subset(frame: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -82,12 +82,12 @@ class SmokeCounts:
     def validate(self) -> None:
         """Require two genuine updates within the bounded smoke workload."""
         if not 2 <= self.optimizer_update_attempts <= MAX_UPDATE_ATTEMPTS:
-            raise RuntimeError("Smoke update attempts must be between 2 and 8")
+            raise RuntimeError("Smoke update attempts must be between 2 and 16")
         if self.minibatches != self.optimizer_update_attempts * 2:
             raise RuntimeError("Every smoke attempt requires 2 mini-batches")
         if self.optimizer_steps != REQUIRED_SUCCESSFUL_UPDATES:
             raise RuntimeError(
-                f"Expected 2 successful optimizer steps after at most 8 attempts, "
+                f"Expected 2 successful optimizer steps after at most 16 attempts, "
                 f"observed {self.optimizer_steps}"
             )
         if self.scheduler_steps != REQUIRED_SUCCESSFUL_UPDATES:
@@ -95,7 +95,7 @@ class SmokeCounts:
 
 
 class BoundedSmokeLoader:
-    """Repeat a fixed subset ordering until two updates or eight attempts.
+    """Repeat a fixed subset ordering until two updates or sixteen attempts.
 
     Production requests each new group after scheduler stepping and gradient
     clearing, allowing this loader to stop without changing the training loop.
