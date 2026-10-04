@@ -10,7 +10,11 @@ from pandas.api.types import is_bool_dtype, is_numeric_dtype
 from grammar_scoring.config.paths import ARTIFACT_DIR, MODELS_DIR, TRANSCRIPTS_DIR
 from grammar_scoring.data.dataset import TEST_CSV
 from grammar_scoring.data.transcripts import load_transcript_jsonl
-from grammar_scoring.inference.deberta import predict_e005_ensemble, validate_test_frame
+from grammar_scoring.inference.deberta import (
+    predict_deberta_ensemble,
+    predict_e005_ensemble,
+    validate_test_frame,
+)
 
 
 def load_test_inputs(test_csv: Path, transcripts: Path) -> pd.DataFrame:
@@ -96,21 +100,52 @@ def main(argv: list[str] | None = None) -> int:
     Returns:
         Zero after successfully writing the validated prediction CSV.
     """
-    parser = argparse.ArgumentParser(description="Generate raw E005 test predictions")
+    return _main(argv, experiment="E005")
+
+
+def main_e008(argv: list[str] | None = None) -> int:
+    """Generate standalone E008 predictions from the canonical 216 test rows.
+
+    Args:
+        argv: CLI arguments, or None to read process arguments.
+
+    Returns:
+        Zero after writing validated raw predictions.
+    """
+    return _main(argv, experiment="E008")
+
+
+def _main(argv: list[str] | None, *, experiment: str) -> int:
+    parser = argparse.ArgumentParser(
+        description=f"Generate raw {experiment} test predictions"
+    )
     parser.add_argument("--test-csv", type=Path, default=TEST_CSV)
     parser.add_argument(
         "--transcripts", type=Path, default=TRANSCRIPTS_DIR / "test.jsonl"
     )
-    parser.add_argument("--model-dir", type=Path, default=MODELS_DIR / "E005")
+    parser.add_argument(
+        "--model-dir",
+        type=Path,
+        default=MODELS_DIR / experiment,
+    )
     parser.add_argument(
         "--output",
         type=Path,
-        default=ARTIFACT_DIR / "submissions" / "E005_test_predictions.csv",
+        default=ARTIFACT_DIR / "submissions" / f"{experiment}_test_predictions.csv",
     )
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     options = parser.parse_args(argv)
     frame = load_test_inputs(options.test_csv, options.transcripts)
-    predictions = predict_e005_ensemble(frame, options.model_dir, device=options.device)
+    if experiment == "E008" and len(frame) != 216:
+        raise ValueError("E008 inference requires exactly 216 canonical test rows")
+    if experiment == "E005":
+        predictions = predict_e005_ensemble(
+            frame, options.model_dir, device=options.device
+        )
+    else:
+        predictions = predict_deberta_ensemble(
+            frame, options.model_dir, device=options.device, experiment=experiment
+        )
     validate_predictions(predictions, frame)
     options.output.parent.mkdir(parents=True, exist_ok=True)
     predictions.to_csv(options.output, index=False)

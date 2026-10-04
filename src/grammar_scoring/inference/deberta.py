@@ -1,4 +1,4 @@
-"""Inference utilities for the E005 fine-tuned DeBERTa ensemble."""
+"""Shared inference utilities for E005 and E008 DeBERTa ensembles."""
 
 from __future__ import annotations
 
@@ -48,11 +48,12 @@ def validate_test_frame(frame: pd.DataFrame) -> pd.DataFrame:
     return frame[["filename", "text"]].reset_index(drop=True).copy()
 
 
-def discover_checkpoints(model_dir: Path) -> list[Path]:
-    """Discover exactly one E005 checkpoint for every canonical fold.
+def discover_checkpoints(model_dir: Path, *, experiment: str = "E005") -> list[Path]:
+    """Discover exactly one checkpoint for every canonical fold.
 
     Args:
         model_dir: Directory containing ``fold_0`` through ``fold_4``.
+        experiment: E005 or E008 identifier used in validation messages.
 
     Returns:
         Checkpoint paths ordered by fold number.
@@ -61,17 +62,21 @@ def discover_checkpoints(model_dir: Path) -> list[Path]:
         FileNotFoundError: If a canonical fold checkpoint is missing.
         ValueError: If unexpected fold directories are present.
     """
+    if experiment not in ("E005", "E008"):
+        raise ValueError(f"Unsupported DeBERTa experiment: {experiment}")
     expected = [model_dir / f"fold_{fold}" / "best.pt" for fold in range(5)]
     missing = [path for path in expected if not path.is_file()]
     if missing:
         formatted = ", ".join(str(path) for path in missing)
-        raise FileNotFoundError(f"Missing E005 checkpoints: {formatted}")
+        raise FileNotFoundError(f"Missing {experiment} checkpoints: {formatted}")
 
     fold_directories = {path.name for path in model_dir.glob("fold_*") if path.is_dir()}
     expected_directories = {f"fold_{fold}" for fold in range(5)}
     unexpected = fold_directories - expected_directories
     if unexpected:
-        raise ValueError(f"Unexpected E005 fold directories: {sorted(unexpected)}")
+        raise ValueError(
+            f"Unexpected {experiment} fold directories: {sorted(unexpected)}"
+        )
 
     return expected
 
@@ -201,21 +206,23 @@ def load_checkpoint(
     return model
 
 
-def predict_e005_ensemble(
+def predict_deberta_ensemble(
     frame: pd.DataFrame,
     model_dir: Path,
     *,
     device: str = "auto",
+    experiment: str = "E005",
     model_factory: Callable[[], nn.Module] | None = None,
     tokenizer_factory: Callable[[], PreTrainedTokenizerBase] | None = None,
 ) -> pd.DataFrame:
-    """Generate equal-weight predictions from all five E005 fold checkpoints.
+    """Generate equal-weight predictions from five E005 or E008 checkpoints.
 
     No clipping, rounding, calibration, or other postprocessing is applied.
 
     Args:
         frame: Test dataframe containing canonical filename and transcript text.
-        model_dir: E005 model directory containing the five fold directories.
+        model_dir: Model directory containing the five fold directories.
+        experiment: E005 or E008 identifier used in validation messages.
         device: ``auto``, ``cpu``, or ``cuda``.
         model_factory: Optional offline test seam for model construction.
         tokenizer_factory: Optional offline test seam for tokenizer construction.
@@ -230,13 +237,13 @@ def predict_e005_ensemble(
     import torch
 
     validated = validate_test_frame(frame)
-    checkpoints = discover_checkpoints(model_dir)
+    checkpoints = discover_checkpoints(model_dir, experiment=experiment)
 
     chosen = torch.device(
         ("cuda" if torch.cuda.is_available() else "cpu") if device == "auto" else device
     )
     if chosen.type not in ("cpu", "cuda"):
-        raise ValueError("E005 inference supports CPU or CUDA only")
+        raise ValueError(f"{experiment} inference supports CPU or CUDA only")
     if chosen.type == "cuda" and not torch.cuda.is_available():
         raise ValueError("CUDA requested but unavailable")
 
@@ -264,7 +271,9 @@ def predict_e005_ensemble(
 
         predicted = predict_loader(model, loader, chosen)
         if len(predicted) != len(validated):
-            raise RuntimeError("E005 prediction count differs from test row count")
+            raise RuntimeError(
+                f"{experiment} prediction count differs from test row count"
+            )
 
         fold_predictions.append(predicted)
 
@@ -276,8 +285,37 @@ def predict_e005_ensemble(
     ensemble = stacked.mean(axis=0)
 
     if not np.isfinite(ensemble).all():
-        raise RuntimeError("Nonfinite E005 ensemble predictions")
+        raise RuntimeError(f"Nonfinite {experiment} ensemble predictions")
 
     result = validated[["filename"]].copy()
     result["label"] = ensemble
     return result
+
+
+def predict_e005_ensemble(
+    frame: pd.DataFrame,
+    model_dir: Path,
+    *,
+    device: str = "auto",
+    model_factory: Callable[[], nn.Module] | None = None,
+    tokenizer_factory: Callable[[], PreTrainedTokenizerBase] | None = None,
+) -> pd.DataFrame:
+    """Generate canonical E005 predictions with the shared implementation.
+
+    Args:
+        frame: Test dataframe containing filename and raw transcript text.
+        model_dir: E005 directory containing the five selected checkpoints.
+        device: ``auto``, ``cpu``, or ``cuda``.
+        model_factory: Optional offline model construction seam.
+        tokenizer_factory: Optional offline tokenizer construction seam.
+
+    Returns:
+        Filename and raw ensemble label predictions in input order.
+    """
+    return predict_deberta_ensemble(
+        frame,
+        model_dir,
+        device=device,
+        model_factory=model_factory,
+        tokenizer_factory=tokenizer_factory,
+    )

@@ -12,6 +12,7 @@ from grammar_scoring.inference.deberta import (
     create_inference_loader,
     discover_checkpoints,
     load_checkpoint,
+    predict_deberta_ensemble,
     predict_e005_ensemble,
     predict_loader,
     validate_test_frame,
@@ -122,7 +123,10 @@ def test_validate_test_frame_rejects_invalid_text(value: object) -> None:
         validate_test_frame(frame)
 
 
-def test_discover_checkpoints_returns_fold_order(tmp_path: Path) -> None:
+@pytest.mark.parametrize("experiment", ["E005", "E008"])
+def test_discover_checkpoints_returns_fold_order(
+    tmp_path: Path, experiment: str
+) -> None:
     expected = []
 
     for fold in reversed(range(5)):
@@ -132,29 +136,35 @@ def test_discover_checkpoints_returns_fold_order(tmp_path: Path) -> None:
         checkpoint.touch()
         expected.append(checkpoint)
 
-    result = discover_checkpoints(tmp_path)
+    result = discover_checkpoints(tmp_path, experiment=experiment)
 
     assert result == [tmp_path / f"fold_{fold}" / "best.pt" for fold in range(5)]
 
 
-def test_discover_checkpoints_rejects_missing_fold(tmp_path: Path) -> None:
+@pytest.mark.parametrize("experiment", ["E005", "E008"])
+def test_discover_checkpoints_rejects_missing_fold(
+    tmp_path: Path, experiment: str
+) -> None:
     for fold in range(4):
         directory = tmp_path / f"fold_{fold}"
         directory.mkdir()
         (directory / "best.pt").touch()
 
     with pytest.raises(FileNotFoundError, match="fold_4"):
-        discover_checkpoints(tmp_path)
+        discover_checkpoints(tmp_path, experiment=experiment)
 
 
-def test_discover_checkpoints_rejects_unexpected_fold(tmp_path: Path) -> None:
+@pytest.mark.parametrize("experiment", ["E005", "E008"])
+def test_discover_checkpoints_rejects_unexpected_fold(
+    tmp_path: Path, experiment: str
+) -> None:
     for fold in range(6):
         directory = tmp_path / f"fold_{fold}"
         directory.mkdir()
         (directory / "best.pt").touch()
 
     with pytest.raises(ValueError, match="fold_5"):
-        discover_checkpoints(tmp_path)
+        discover_checkpoints(tmp_path, experiment=experiment)
 
 
 def test_load_checkpoint_restores_state_dict(tmp_path: Path) -> None:
@@ -197,7 +207,9 @@ def test_predict_loader_rejects_nonfinite_predictions() -> None:
         predict_loader(model, loader, torch.device("cpu"))
 
 
+@pytest.mark.parametrize("experiment", ["E005", "E008"])
 def test_ensemble_averages_five_raw_fold_predictions(
+    experiment: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -223,14 +235,22 @@ def test_ensemble_averages_five_raw_fold_predictions(
         lambda frame, tokenizer: (fake_loader, 0),
     )
 
-    result = predict_e005_ensemble(
+    used = []
+
+    def model_factory():
+        used.append(True)
+        return FakeModel()
+
+    result = predict_deberta_ensemble(
         frame,
         tmp_path,
         device="cpu",
-        model_factory=FakeModel,
+        experiment=experiment,
+        model_factory=model_factory,
         tokenizer_factory=lambda: SimpleNamespace(),
     )
 
+    assert len(used) == 5
     assert result.columns.tolist() == ["filename", "label"]
     assert result["filename"].tolist() == frame["filename"].tolist()
     np.testing.assert_allclose(result["label"], [2.0, 2.0, 2.0])
@@ -327,3 +347,35 @@ def test_create_inference_loader_uses_e005_tokenization_contract() -> None:
 
     assert batch["input_ids"].shape == (3, 256)
     assert batch["attention_mask"].shape == (3, 256)
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), -float("inf")])
+def test_e008_ensemble_rejects_nonfinite_fold(tmp_path, monkeypatch, value):
+    for fold in range(5):
+        directory = tmp_path / f"fold_{fold}"
+        directory.mkdir()
+        torch.save(
+            FakeModel(value if fold == 2 else 1.0).state_dict(),
+            directory / "best.pt",
+        )
+    loader = [{"input_ids": torch.ones((3, 2), dtype=torch.long)}]
+    monkeypatch.setattr(
+        "grammar_scoring.inference.deberta.create_inference_loader",
+        lambda frame, tokenizer: (loader, 0),
+    )
+    with pytest.raises(RuntimeError, match="Nonfinite"):
+        predict_deberta_ensemble(
+            _frame(),
+            tmp_path,
+            experiment="E008",
+            device="cpu",
+            model_factory=FakeModel,
+            tokenizer_factory=lambda: SimpleNamespace(),
+        )
+
+
+def test_load_checkpoint_rejects_incompatible_state(tmp_path):
+    checkpoint = tmp_path / "best.pt"
+    torch.save({"unexpected": torch.tensor(1.0)}, checkpoint)
+    with pytest.raises(RuntimeError, match="Missing key"):
+        load_checkpoint(FakeModel(), checkpoint, torch.device("cpu"))
