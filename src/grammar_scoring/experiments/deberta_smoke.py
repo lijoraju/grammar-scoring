@@ -55,16 +55,19 @@ def smoke_subset(frame: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     return training, validation
 
 
-def smoke_root(path: Path) -> Path:
+def smoke_root(path: Path, experiment: str = "E005") -> Path:
     """Require a resolved smoke/E005 namespace outside canonical output trees."""
     resolved = path.resolve()
-    if resolved.name != "E005" or resolved.parent.name != "smoke":
-        raise ValueError("Smoke output must be a separate .../smoke/E005 directory")
+    if resolved.name != experiment or resolved.parent.name != "smoke":
+        raise ValueError(
+            f"Smoke output must be a separate .../smoke/{experiment} directory"
+        )
     pairs = zip(resolved.parts, resolved.parts[1:], strict=False)
     if any(
-        left in {"models", "experiments"} and right == "E005" for left, right in pairs
+        left in {"models", "experiments"} and right == experiment
+        for left, right in pairs
     ):
-        raise ValueError("Smoke output cannot be inside canonical E005 directories")
+        raise ValueError(f"Existing {experiment} configuration mismatch")
     return resolved
 
 
@@ -409,14 +412,22 @@ def gpu_memory(device: TorchDevice) -> dict[str, int]:
     return values
 
 
-def run_smoke(transcript_dir: Path, fold_path: Path, output_root: Path) -> Path:
+def run_smoke(
+    transcript_dir: Path,
+    fold_path: Path,
+    output_root: Path,
+    *,
+    frame: pd.DataFrame | None = None,
+    experiment: str = "E005",
+) -> Path:
     """Run bounded GPU smoke updates without canonical fold orchestration."""
     import torch
 
-    print(NOTICE, flush=True)
+    notice = f"SMOKE TEST ONLY — NOT {experiment} RESULT"
+    print(notice, flush=True)
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required; the smoke test cannot run on CPU")
-    root = smoke_root(output_root)
+    root = smoke_root(output_root, experiment)
     from transformers import AutoTokenizer, get_linear_schedule_with_warmup
 
     from grammar_scoring.models.deberta_regressor import DebertaRegressor
@@ -425,7 +436,9 @@ def run_smoke(transcript_dir: Path, fold_path: Path, output_root: Path) -> Path:
     seed_everything()
     runtime = {**runtime_info(device), "amp_enabled": True}
     print(json.dumps(runtime, indent=2), flush=True)
-    training, validation = smoke_subset(load_inputs(transcript_dir, fold_path))
+    training, validation = smoke_subset(
+        load_inputs(transcript_dir, fold_path) if frame is None else frame
+    )
     selected = {
         "training": training.filename.tolist(),
         "validation": validation.filename.tolist(),
@@ -610,7 +623,7 @@ def run_smoke(transcript_dir: Path, fold_path: Path, output_root: Path) -> Path:
         key: value for key, value in metrics.items() if math.isfinite(value)
     }
     report = {
-        "notice": NOTICE,
+        "notice": notice,
         "status": "PASS",
         "runtime": runtime,
         "canonical_reference_config": asdict(CONFIG),
@@ -636,7 +649,7 @@ def run_smoke(transcript_dir: Path, fold_path: Path, output_root: Path) -> Path:
         json.dumps(_finite_json(report), indent=2, allow_nan=False) + "\n",
         encoding="utf-8",
     )
-    print(NOTICE, json.dumps(report, indent=2), flush=True)
+    print(notice, json.dumps(report, indent=2), flush=True)
     checks = [
         "CUDA available",
         "real DeBERTa model loaded",
@@ -659,7 +672,7 @@ def run_smoke(transcript_dir: Path, fold_path: Path, output_root: Path) -> Path:
         print(
             "[INFO] No padding in these batches; padded-position exclusion is vacuous."
         )
-    print(NOTICE, "PASS", flush=True)
+    print(notice, "PASS", flush=True)
     return directory
 
 

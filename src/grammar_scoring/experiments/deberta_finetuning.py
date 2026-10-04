@@ -579,11 +579,6 @@ def run_experiment(
     Every newly trained fold calls each factory independently after reseeding.
     CUDA OOM propagates; batch size and protocol are never adjusted.
     """
-    import torch
-    from transformers import AutoTokenizer
-
-    from grammar_scoring.models.deberta_regressor import DebertaRegressor
-
     if "split" in frame and not frame["split"].eq("train").all():
         raise ValueError("E005 accepts only train records")
     # Revalidate public entry-point inputs instead of trusting a caller's frame.
@@ -592,6 +587,35 @@ def run_experiment(
         frame[["filename", "text"]].assign(split="train"),
         frame[["filename", "label", "fold"]],
     )
+    return _run_aligned_experiment(
+        frame,
+        artifact_dir,
+        device=device,
+        resume=resume,
+        fold=fold,
+        model_factory=model_factory,
+        tokenizer_factory=tokenizer_factory,
+    )
+
+
+def _run_aligned_experiment(
+    frame: pd.DataFrame,
+    artifact_dir: Path,
+    *,
+    experiment: str = "E005",
+    oof_name: str = "E005_deberta_finetuned",
+    device: str = "auto",
+    resume: bool = False,
+    fold: int | None = None,
+    model_factory: Callable[[], nn.Module] | None = None,
+    tokenizer_factory: Callable[[], PreTrainedTokenizerBase] | None = None,
+) -> dict[str, Any]:
+    """Share the unchanged E005 protocol across validated populations."""
+    import torch
+    from transformers import AutoTokenizer
+
+    from grammar_scoring.models.deberta_regressor import DebertaRegressor
+
     identity = experiment_identity(frame)
     if fold is not None:
         split_fold(frame, fold)
@@ -606,14 +630,14 @@ def run_experiment(
     tokenizer_factory = tokenizer_factory or (
         lambda: AutoTokenizer.from_pretrained(CONFIG.model_name)
     )
-    experiment_dir = artifact_dir / "experiments" / "E005"
+    experiment_dir = artifact_dir / "experiments" / experiment
     config_path = experiment_dir / "config.json"
     if config_path.exists() and json.loads(config_path.read_text()) != asdict(CONFIG):
-        raise ValueError("Existing E005 configuration mismatch")
+        raise ValueError(f"Existing {experiment} configuration mismatch")
     _write_json(config_path, asdict(CONFIG))
     results = []
     for current in range(5) if fold is None else [fold]:
-        directory = artifact_dir / "models" / "E005" / f"fold_{current}"
+        directory = artifact_dir / "models" / experiment / f"fold_{current}"
         if resume and directory.exists():
             result = validate_completed_fold(directory, frame, current, identity)
         else:
@@ -651,7 +675,7 @@ def run_experiment(
     oof = assemble_oof(frame, results)
     training = [row for result in results for row in result["training"]]
     summary = {
-        "experiment": "E005",
+        "experiment": experiment,
         "identity": identity,
         "oof_metrics": regression_metrics(oof.label, oof.prediction),
         "diagnostic_training_rmse": rmse(
@@ -666,7 +690,7 @@ def run_experiment(
             result["token_count_exceeds_max_length"] for result in results
         ],
     }
-    output = artifact_dir / "oof" / "E005_deberta_finetuned.csv"
+    output = artifact_dir / "oof" / f"{oof_name}.csv"
     output.parent.mkdir(parents=True, exist_ok=True)
     oof.to_csv(output, index=False)
     _write_json(experiment_dir / "training_history.json", history)
