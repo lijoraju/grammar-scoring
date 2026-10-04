@@ -40,9 +40,23 @@ kaggle.json
 /artifacts/
 *.wav
 *.WAV
+submission.csv
+train.csv
+test.csv
+sample_submission.csv
+
+# Generated embedding matrices and vector indexes
+*embeddings*.npy
+*embeddings*.npz
+minilm_train.npz
+minilm_test.npz
+deberta_v3_base_train.npz
+deberta_v3_base_test.npz
+*.faiss
 
 # Model checkpoints and weights
 *.ckpt
+*.bin
 *.pt
 *.pth
 *.pkl
