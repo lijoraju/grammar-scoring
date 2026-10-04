@@ -120,6 +120,28 @@ def compare_oof(
     }
 
 
+def e009_diagnostics(oof: pd.DataFrame, retained: pd.DataFrame) -> dict[str, Any]:
+    """Report standalone E009 pooled/fold metrics without baseline statistics."""
+    aligned = validate_oof(oof, retained)
+    return {
+        "experiment": "E009",
+        "alpha": 1.0,
+        "seed": 42,
+        "n": len(aligned),
+        "e009": regression_metrics(aligned.label, aligned.prediction),
+        "per_fold": [
+            {
+                "fold": int(fold),
+                "n": len(group),
+                "e009": regression_metrics(group.label, group.prediction),
+            }
+            for fold, group in aligned.groupby("fold", sort=True)
+        ],
+        "e008_comparison_status": "not_run",
+        "e008_oof_path": None,
+    }
+
+
 def select_smoke_recordings(
     retained: pd.DataFrame, audio_dir: Path
 ) -> tuple[list[str], list[str]]:
@@ -237,7 +259,8 @@ def main() -> None:
     parser.add_argument(
         "--e008-oof",
         type=Path,
-        default=ARTIFACT_DIR / "oof/E008_deberta_no_zero_block.csv",
+        default=None,
+        help="Optional E008 OOF for strict paired comparison; ignored by --smoke",
     )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--chunk-batch-size", type=int, default=4)
@@ -245,10 +268,10 @@ def main() -> None:
     parser.add_argument("--smoke", action="store_true")
     args = parser.parse_args()
     retained = retained_population(load_train_dataframe(), pd.read_csv(args.fold_path))
-    baseline = pd.read_csv(args.e008_oof)
-    validate_oof(baseline, retained)
-    encoder = FrozenWavLM(args.device, args.chunk_batch_size, revision=args.revision)
     if args.smoke:
+        encoder = FrozenWavLM(
+            args.device, args.chunk_batch_size, revision=args.revision
+        )
         run_smoke(
             retained,
             args.audio_dir,
@@ -256,11 +279,23 @@ def main() -> None:
             args.artifact_dir / "smoke/E009/summary.json",
         )
         return
+    baseline = None
+    if args.e008_oof is not None:
+        if not args.e008_oof.is_file():
+            raise FileNotFoundError(f"E008 OOF file does not exist: {args.e008_oof}")
+        baseline = pd.read_csv(args.e008_oof)
+        validate_oof(baseline, retained)
+    encoder = FrozenWavLM(args.device, args.chunk_batch_size, revision=args.revision)
     matrix, metadata = extract_embeddings(
         retained, args.audio_dir, args.artifact_dir / "embeddings/E009", encoder
     )
     oof = evaluate_ridge(matrix, metadata, retained)
-    report = compare_oof(oof, baseline, retained)
+    if baseline is None:
+        report = e009_diagnostics(oof, retained)
+    else:
+        report = compare_oof(oof, baseline, retained)
+        report["e008_comparison_status"] = "completed"
+        report["e008_oof_path"] = str(args.e008_oof)
     output = args.artifact_dir / "oof/E009_wavlm_ridge.csv"
     output.parent.mkdir(parents=True, exist_ok=True)
     oof.to_csv(output, index=False)

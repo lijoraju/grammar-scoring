@@ -328,3 +328,139 @@ def test_smoke_report_offline(monkeypatch, tmp_path):
         assert row["embedding_dimension"] == 768 and row["finite"]
         assert len(row["valid_hidden_frame_counts"]) == row["num_chunks"]
         assert row["batch_size_invariance_passed"]
+
+
+@pytest.fixture
+def cli_inputs(inputs, tmp_path, monkeypatch):
+    import sys
+
+    train, folds, retained, metadata, matrix = inputs
+    # Use canonical half-point targets so CSV round trips preserve exact identity.
+    train["label"] = np.round(train.label * 2) / 2
+    folds["label"] = train.label
+    retained = experiment.retained_population(train, folds)
+    metadata["label"] = retained.label
+    fold_path = tmp_path / "folds.csv"
+    folds.to_csv(fold_path, index=False)
+    monkeypatch.setattr(experiment, "load_train_dataframe", lambda: train)
+    monkeypatch.setattr(experiment, "FrozenWavLM", lambda *args, **kwargs: object())
+    monkeypatch.setattr(
+        experiment, "extract_embeddings", lambda *args: (matrix, metadata)
+    )
+    argv = [
+        "run_wavlm_ridge.py",
+        "--fold-path",
+        str(fold_path),
+        "--artifact-dir",
+        str(tmp_path),
+    ]
+    monkeypatch.setattr(sys, "argv", argv)
+    return retained, tmp_path, argv
+
+
+@pytest.mark.parametrize("supplied", [False, True])
+def test_smoke_cli_never_reads_baseline(cli_inputs, monkeypatch, supplied):
+    _, directory, argv = cli_inputs
+    argv.append("--smoke")
+    if supplied:
+        argv.extend(["--e008-oof", str(directory / "nonexistent.csv")])
+    calls = []
+    monkeypatch.setattr(experiment, "run_smoke", lambda *args: calls.append(args))
+    monkeypatch.setattr(
+        experiment,
+        "extract_embeddings",
+        lambda *args: pytest.fail("Full extraction invoked by smoke"),
+    )
+    experiment.main()
+    assert len(calls) == 1
+    assert not (directory / "oof/E009_wavlm_ridge.csv").exists()
+
+
+def test_full_cli_without_baseline(cli_inputs):
+    import json
+
+    retained, directory, _ = cli_inputs
+    experiment.main()
+    oof = pd.read_csv(directory / "oof/E009_wavlm_ridge.csv")
+    report = json.loads((directory / "experiments/E009/diagnostics.json").read_text())
+    assert len(oof) == 732 and oof.filename.is_unique
+    assert oof.filename.tolist() == retained.filename.tolist()
+    assert np.isfinite(oof.prediction).all()
+    assert report["e009"] == pytest.approx(
+        experiment.regression_metrics(oof.label, oof.prediction)
+    )
+    assert len(report["per_fold"]) == 5
+    for row in report["per_fold"]:
+        group = oof.loc[oof.fold == row["fold"]]
+        assert row["e009"] == pytest.approx(
+            experiment.regression_metrics(group.label, group.prediction)
+        )
+    assert report["e008_comparison_status"] == "not_run"
+    assert report["e008_oof_path"] is None
+    assert "e008" not in report and "rmse_delta" not in report
+    assert all("e008" not in row for row in report["per_fold"])
+
+
+def test_full_cli_with_baseline_preserves_comparison(cli_inputs):
+    import json
+
+    retained, directory, argv = cli_inputs
+    baseline = retained.assign(prediction=np.linspace(1.2, 4.2, 732))
+    path = directory / "baseline.csv"
+    baseline.iloc[::-1].to_csv(path, index=False)
+    argv.extend(["--e008-oof", str(path)])
+    experiment.main()
+    oof = pd.read_csv(directory / "oof/E009_wavlm_ridge.csv")
+    report = json.loads((directory / "experiments/E009/diagnostics.json").read_text())
+    expected = experiment.compare_oof(oof, pd.read_csv(path), retained)
+    assert report["e008_comparison_status"] == "completed"
+    assert report["e008_oof_path"] == str(path)
+    for key in (
+        "e008",
+        "e009",
+        "prediction_correlation",
+        "residual_correlation",
+        "rmse_delta",
+        "pearson_delta",
+    ):
+        assert report[key] == pytest.approx(expected[key])
+    for actual, comparison in zip(
+        report["per_fold"], expected["per_fold"], strict=True
+    ):
+        for key in ("e008", "e009", "rmse_delta", "pearson_delta"):
+            assert actual[key] == pytest.approx(comparison[key])
+
+
+@pytest.mark.parametrize("column", ["filename", "label", "fold"])
+def test_supplied_misaligned_baseline_fails_before_encoder(
+    cli_inputs, monkeypatch, column
+):
+    retained, directory, argv = cli_inputs
+    baseline = retained.assign(prediction=2.0)
+    baseline.loc[0, column] = "other.wav" if column == "filename" else 99
+    path = directory / "misaligned.csv"
+    baseline.to_csv(path, index=False)
+    argv.extend(["--e008-oof", str(path)])
+    monkeypatch.setattr(
+        experiment,
+        "FrozenWavLM",
+        lambda *args, **kwargs: pytest.fail(
+            "Encoder constructed before alignment validation"
+        ),
+    )
+    with pytest.raises(ValueError):
+        experiment.main()
+
+
+def test_supplied_missing_baseline_fails_clearly(cli_inputs, monkeypatch):
+    _, directory, argv = cli_inputs
+    argv.extend(["--e008-oof", str(directory / "missing.csv")])
+    monkeypatch.setattr(
+        experiment,
+        "FrozenWavLM",
+        lambda *args, **kwargs: pytest.fail(
+            "Encoder constructed before path validation"
+        ),
+    )
+    with pytest.raises(FileNotFoundError, match="E008 OOF file does not exist"):
+        experiment.main()
