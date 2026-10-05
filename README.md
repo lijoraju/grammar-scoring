@@ -1,9 +1,10 @@
 # Grammar Scoring Engine
 
 An end-to-end speech grammar scoring system that predicts continuous grammar
-scores from spoken English audio. The final model, **E015**, is an equal-weight
-ensemble of fine-tuned DeBERTa-v3 regressors that read both the default Whisper
-transcript and a disfluency-preserving ("verbatim") Whisper transcript.
+scores from spoken English audio. The final model, **E020**, is an equal-weight
+ensemble of fine-tuned DeBERTa-v3 regressors that read three kinds of transcript:
+the default Whisper transcript, disfluency-preserving ("verbatim") Whisper
+transcripts, and a literal wav2vec2 CTC transcript decoded without a language model.
 
 ## Problem
 
@@ -18,9 +19,10 @@ and 216 test recordings; test labels are never used for development.
 ```text
                ┌─ Whisper large-v3, default            → canonical transcript ─┐
 audio (.wav) ──┼─ Whisper large-v3, disfluent prompt   → verbatim v1 ──────────┴─ DeBERTa (dual) ─┐
-               └─ Whisper large-v3, per-window cue     → verbatim v2 ─────────── DeBERTa ─────────┤
+               ├─ Whisper large-v3, per-window cue     → verbatim v2 ─────────── DeBERTa ─────────┤
+               └─ wav2vec2-large CTC, no LM             → literal CTC ─────────── DeBERTa ─────────┤
                                                                                                   ▼
-          equal-weight mean of 4 groups: {large, base} × {dual, v2}, 2–3 seeds each → grammar score
+      equal-weight mean of 6 groups: {large, base} × {dual, v2, CTC}, 2–3 seeds each → grammar score
 ```
 
 **Why verbatim transcripts.** Default Whisper is built to produce clean text: its
@@ -31,6 +33,13 @@ it transcribe what was actually said (fillers rise from 0.3 to about 4 per 100
 words). Verbatim v1 conditions on previous text; v2 re-inserts a short style cue
 into every 30 s window instead, which removes v1's rare repetition loops. Code:
 [`transcription/verbatim.py`](src/grammar_scoring/transcription/verbatim.py).
+
+**Why a CTC transcript.** `wav2vec2-large-960h-lv60-self` emits characters frame by
+frame and greedy decoding uses no language model, so nothing smooths the words
+("i like to playground", "a lot kids"). It is weaker alone (no punctuation, more
+spelling errors on accented speech) but its errors differ from Whisper's, which is
+what an ensemble needs. Code:
+[`transcription/ctc.py`](src/grammar_scoring/transcription/ctc.py).
 
 **Models** ([`experiments/e014_finetune.py`](src/grammar_scoring/experiments/e014_finetune.py)).
 Fully fine-tuned `microsoft/deberta-v3-large` (lr 1e-5, layer-wise LR decay 0.9)
@@ -87,7 +96,8 @@ comparable. The matched E005 diagnostic above provides the relevant E008 baselin
 | E017 | + GEC edit rate / LLM rubric judge features | 732 | 0.5725 | 0.8253 | Rejected |
 | E019 | + disfluency / fluency / length features | 732 | 0.5642 | 0.8308 | Rejected |
 | E015 | Dual-transcript large ×3 + base ×3 | 732 | 0.5603 | 0.8336 | Superseded |
-| **E015** | **Dual large/base + verbatim-v2 large/base (final)** | **732** | **0.5545** | **0.8372** | **Selected** |
+| E015 | Dual large/base + verbatim-v2 large/base | 732 | 0.5545 | 0.8372 | Superseded |
+| **E020** | **+ wav2vec2 CTC large/base (6 groups, final)** | **732** | **0.5466** | **0.8426** | **Selected** |
 
 E014–E019 ran on the same 732 rows and frozen folds as E008, so their OOF numbers
 are directly comparable with it. A candidate was accepted only if it improved pooled
@@ -103,12 +113,12 @@ base-model predictions introduce cross-fold dependencies, as detailed in
 
 ## Results
 
-| Evaluation | Final E015 result |
+| Evaluation | Final E020 result |
 | --- | ---: |
-| Training-data RMSE (5-fold OOF, 732 rows) | **0.5545** |
-| Training-data Pearson (5-fold OOF, 732 rows) | **0.8372** |
-| Per-fold RMSE (mean ± std) | 0.5538 ± 0.0224 |
-| Public Kaggle leaderboard score | 0.3778 |
+| Training-data RMSE (5-fold OOF, 732 rows) | **0.5466** |
+| Training-data Pearson (5-fold OOF, 732 rows) | **0.8426** |
+| Per-fold RMSE (mean ± std) | 0.5454 ± 0.0307 |
+| Public Kaggle leaderboard score | **0.3712** |
 
 | Submission | OOF RMSE | OOF Pearson | Public LB |
 | --- | ---: | ---: | ---: |
@@ -117,12 +127,13 @@ base-model predictions introduce cross-fold dependencies, as detailed in
 | E015, 3 groups | 0.5670 | 0.8290 | 0.3816 |
 | E015, 4 groups | 0.5626 | 0.8319 | 0.3755 |
 | E015, dual large + base | 0.5603 | 0.8336 | 0.3800 |
-| **E015, final** | **0.5545** | **0.8372** | 0.3778 |
+| E015, dual + verbatim v2 | 0.5545 | 0.8372 | 0.3778 |
+| **E020, + CTC (final)** | **0.5466** | **0.8426** | **0.3712** |
 
 The leaderboard score is a separate external signal computed on part of the 216
-test rows; the last four submissions differ by less than its noise, so model
-selection used OOF metrics only (no leaderboard probing or selection by public
-score). OOF RMSE fell 10.5% relative to E008.
+test rows and moves by a few thousandths from noise alone, so model selection used
+OOF metrics only (no leaderboard probing or selection by public score). OOF RMSE
+fell 11.8% relative to E008, and E020 is also the best public score.
 
 ## Repository Structure
 
@@ -150,17 +161,18 @@ Credentials must remain external.
 ## Reproducing the Final Submission
 
 The final report and submission notebook is
-[notebooks/03_final_e015_submission.ipynb](notebooks/03_final_e015_submission.ipynb).
+[notebooks/03_final_submission.ipynb](notebooks/03_final_submission.ipynb).
 It recomputes every metric and figure from the stored per-run OOF and test
 predictions and writes the 216-row `submission.csv` (CPU, seconds). Locally it reads
 `artifacts/final_e015/`; on Kaggle, attach the competition, the private dataset
-`lijoraju94/grammar-scoring-e015-final-artifacts` (per-run predictions and verbatim
-transcripts) and `lijoraju94/grammar-scoring-canonical-artifacts`.
+`lijoraju94/grammar-scoring-e015-final-artifacts` (per-run predictions plus the
+verbatim and CTC transcripts) and `lijoraju94/grammar-scoring-canonical-artifacts`.
 
 Training each run (GPU; about 6–40 min per seed on a T4):
 
 ```sh
 python scripts/transcribe_verbatim.py --data-dir <Dataset_Final> --output-dir <out> --variant v1
+python scripts/transcribe_ctc.py --data-dir <Dataset_Final> --output-dir <ctc_out>
 python scripts/run_e014_finetune.py --data-dir <Dataset_Final> \
     --transcript-dir <canonical> --alt-transcript-dir <verbatim_v1> \
     --model-name microsoft/deberta-v3-large --learning-rate 1e-5 --layer-decay 0.9 \
@@ -221,6 +233,8 @@ Fresh local validation: **745 tests passed** (three warnings). Ruff lint and for
   disfluencies and uncorrected errors, gave the largest consistent gains; training
   each model on both transcripts of a clip helped base (≈0.605 → 0.583 seed-mean
   OOF RMSE) and large (≈0.594 → 0.580) alike.
+- A literal CTC transcript (no language model) is weaker alone but adds diversity:
+  two CTC groups improved OOF RMSE from 0.5545 to 0.5466 across all five folds.
 - Larger encoders and seed averaging helped; a 7B LLM regressor, explicit grammar
   features (GEC edit rate, LLM rubric judge) and fluency features added nothing
   beyond the fine-tuned ensemble.
