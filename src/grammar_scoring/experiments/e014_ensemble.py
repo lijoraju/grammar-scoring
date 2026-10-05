@@ -12,7 +12,7 @@ models that produced them.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 import numpy as np
@@ -157,6 +157,35 @@ def ensemble_predictions(
     return pd.DataFrame({"filename": test["filename"], "label": prediction})
 
 
+def load_groups(
+    groups: Mapping[str, Sequence[Path]],
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Load runs and add one equal-weight seed-average column per group.
+
+    Args:
+        groups: Mapping from group name to its run directories. Run directory
+            names must be unique across groups.
+
+    Returns:
+        ``(oof, test)`` from :func:`load_runs` with an extra column per group
+        holding the mean of that group's runs.
+
+    Raises:
+        ValueError: If a group is empty or run names are not unique.
+    """
+    runs = [Path(run) for group in groups.values() for run in group]
+    if any(not group for group in groups.values()):
+        raise ValueError("Every group needs at least one run")
+    if len({run.name for run in runs}) != len(runs):
+        raise ValueError("Run directory names must be unique across groups")
+    oof, test = load_runs(runs)
+    for name, group in groups.items():
+        columns = [Path(run).name for run in group]
+        oof[name] = oof[columns].mean(axis=1)
+        test[name] = test[columns].mean(axis=1)
+    return oof, test
+
+
 def main(argv: Sequence[str] | None = None) -> None:
     """Report OOF metrics and write an equal-weight-per-group submission.
 
@@ -171,13 +200,12 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--group", action="append", required=True)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args(argv)
-    groups = [[Path(p) for p in group.split(",")] for group in args.group]
-    oof, test = load_runs([run for group in groups for run in group])
-    for index, group in enumerate(groups):
-        names = [run.name for run in group]
-        oof[f"group_{index}"] = oof[names].mean(axis=1)
-        test[f"group_{index}"] = test[names].mean(axis=1)
-    columns = [f"group_{index}" for index in range(len(groups))]
+    groups = {
+        f"group_{index}": [Path(p) for p in group.split(",")]
+        for index, group in enumerate(args.group)
+    }
+    oof, test = load_groups(groups)
+    columns = list(groups)
     print(json.dumps(ensemble_report(oof, columns), indent=2))
     submission = ensemble_predictions(oof, test, columns, calibrate=False)
     submission.to_csv(args.output, index=False)

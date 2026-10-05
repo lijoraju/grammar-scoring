@@ -9,6 +9,7 @@ from grammar_scoring.experiments.e014_ensemble import (
     ensemble_predictions,
     ensemble_report,
     fit_line,
+    load_groups,
     load_runs,
 )
 from grammar_scoring.experiments.e014_finetune import (
@@ -159,3 +160,18 @@ def test_load_runs_rejects_misaligned_runs(tmp_path):
     b = _write_run(tmp_path, "b", labels, [1.0, 2.0], labels + 1, folds)
     with pytest.raises(ValueError, match="disagree"):
         load_runs([a, b])
+
+
+def test_load_groups_adds_equal_weight_group_columns(tmp_path):
+    labels = np.array([1.0, 2.0, 3.0])
+    folds = np.array([0, 1, 2])
+    a = _write_run(tmp_path, "a", labels, [1.0, 3.0], labels, folds)
+    b = _write_run(tmp_path, "b", labels + 1, [2.0, 4.0], labels, folds)
+    c = _write_run(tmp_path, "c", labels + 3, [5.0, 5.0], labels, folds)
+    oof, test = load_groups({"g1": [a, b], "g2": [c]})
+    assert oof["g1"].tolist() == pytest.approx((labels + 0.5).tolist())
+    assert test["g2"].tolist() == [5.0, 5.0]
+    with pytest.raises(ValueError, match="unique"):
+        load_groups({"g1": [a], "g2": [a]})
+    with pytest.raises(ValueError, match="at least one"):
+        load_groups({"g1": [a], "g2": []})
