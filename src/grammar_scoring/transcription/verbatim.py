@@ -25,6 +25,8 @@ VERBATIM_PROMPT = (
     "Umm, so, uh, I- I went to the, the park and, like, we was playing... "
     "Hmm, let me think. And then, uh, he don't- he didn't come."
 )
+# Short disfluent style cue that faster-whisper re-inserts into every window.
+VERBATIM_HOTWORDS = "Umm, uh, I- I, like, you know, hmm"
 
 
 @dataclass(frozen=True)
@@ -39,6 +41,9 @@ class VerbatimConfig:
         initial_prompt: Disfluent style prompt for the first window.
         condition_on_previous_text: Carry decoded text (and style) forward.
         vad_filter: Whether to drop non-speech with Silero VAD.
+        hotwords: Style cue prepended to every window's prompt (None disables).
+        compression_ratio_threshold: Re-decode windows whose text compresses
+            better than this (repetition loops).
     """
 
     model_name: str = "large-v3"
@@ -48,6 +53,20 @@ class VerbatimConfig:
     initial_prompt: str = VERBATIM_PROMPT
     condition_on_previous_text: bool = True
     vad_filter: bool = False
+    hotwords: str | None = None
+    compression_ratio_threshold: float = 2.4
+
+
+# v2 avoids repetition loops by not carrying decoded text forward; the style is
+# kept in every window by the hotwords cue instead.
+VARIANTS = {
+    "v1": VerbatimConfig(),
+    "v2": VerbatimConfig(
+        condition_on_previous_text=False,
+        hotwords=VERBATIM_HOTWORDS,
+        compression_ratio_threshold=2.0,
+    ),
+}
 
 
 def audio_files(audio_dir: Path) -> list[Path]:
@@ -99,6 +118,8 @@ def transcribe_split(
                 initial_prompt=config.initial_prompt,
                 condition_on_previous_text=config.condition_on_previous_text,
                 vad_filter=config.vad_filter,
+                hotwords=config.hotwords,
+                compression_ratio_threshold=config.compression_ratio_threshold,
             )
             segments = list(segments)
             record = {
@@ -123,8 +144,9 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--data-dir", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--variant", choices=sorted(VARIANTS), default="v1")
     args = parser.parse_args(argv)
-    config = VerbatimConfig()
+    config = VARIANTS[args.variant]
     args.output_dir.mkdir(parents=True, exist_ok=True)
     for split in ("train", "test"):
         transcribe_split(
