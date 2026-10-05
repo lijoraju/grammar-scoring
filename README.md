@@ -1,11 +1,12 @@
 # Grammar Scoring Engine
 
 An end-to-end speech grammar scoring system that predicts continuous grammar
-scores from spoken English audio. The final model, **E022**, blends two channels:
+scores from spoken English audio. The final model, **E024**, blends two channels:
 an equal-weight ensemble of fine-tuned DeBERTa-v3 regressors that read three kinds
 of transcript (default Whisper, disfluency-preserving "verbatim" Whisper, and a
 literal wav2vec2 CTC transcript), and a frozen WavLM audio regressor that hears
-what transcripts lose. Final score = 0.6 × text + 0.4 × audio.
+what transcripts lose. The 0.6 × text + 0.4 × audio blend is then stretched by a
+cross-fitted linear calibration and clipped to the rubric range [1, 5].
 
 ## Problem
 
@@ -27,7 +28,7 @@ audio (.wav) ──┼─ Whisper large-v3, disfluent prompt   → verbatim v1 �
 
 audio (.wav) ── frozen WavLM-base-plus (20 s chunks, mean-pooled) ── RBF-SVR ── audio
 
-                     grammar score = 0.6 × text + 0.4 × audio
+      grammar score = clip(−0.480 + 1.135 × (0.6 × text + 0.4 × audio), 1, 5)
 ```
 
 **Why verbatim transcripts.** Default Whisper is built to produce clean text: its
@@ -55,6 +56,13 @@ The SVR's `C`/`epsilon` are tuned by an inner CV inside each training fold, and 
 40% audio weight is chosen by nested CV (every fold independently picked 0.40–0.45).
 The earlier E009 used the same embeddings with `Ridge(alpha=1.0)`, which is badly
 under-regularized for 768 features and scored only 0.90.
+
+**Why calibration (E024).** Averaging two channels pulls predictions towards the
+mean. For each fold, a line `label ≈ a + b × blend` fitted on the other folds' OOF
+blend stretches the held-out fold (slopes 1.12–1.15 in every fold), and predictions
+are clipped to [1, 5]; the test line is fitted on all OOF blend predictions. This
+idea comes from a top public solution; it did not help the text-only ensemble, whose
+predictions were already well scaled.
 
 **Models** ([`experiments/e014_finetune.py`](src/grammar_scoring/experiments/e014_finetune.py)).
 Fully fine-tuned `microsoft/deberta-v3-large` (lr 1e-5, layer-wise LR decay 0.9)
@@ -114,7 +122,9 @@ comparable. The matched E005 diagnostic above provides the relevant E008 baselin
 | E015 | Dual large/base + verbatim-v2 large/base | 732 | 0.5545 | 0.8372 | Superseded |
 | E020 | + wav2vec2 CTC large/base (6 text groups) | 732 | 0.5466 | 0.8426 | Superseded |
 | E021 | + RoBERTa-large dual as a 7th text group | 732 | 0.5443 | 0.8442 | Rejected (3/5 folds) |
-| **E022** | **E020 text (60%) + WavLM RBF-SVR audio (40%), nested (final)** | **732** | **0.5073** | **0.8720** | **Selected** |
+| E022 | E020 text (60%) + WavLM RBF-SVR audio (40%), nested | 732 | 0.5073 | 0.8720 | Superseded |
+| E023 | E020 text + WavLM-large & Whisper-encoder audio (55%) | 732 | 0.4809 | 0.8862 | Rejected (LB 0.3649) |
+| **E024** | **E022 + cross-fitted calibration, clip [1, 5] (final)** | **732** | **0.4942** | **0.8734** | **Selected** |
 
 E014–E019 ran on the same 732 rows and frozen folds as E008, so their OOF numbers
 are directly comparable with it. A candidate was accepted only if it improved pooled
@@ -130,12 +140,11 @@ base-model predictions introduce cross-fold dependencies, as detailed in
 
 ## Results
 
-| Evaluation | Final E022 result |
+| Evaluation | Final E024 result |
 | --- | ---: |
-| Training-data RMSE (5-fold OOF, nested, 732 rows) | **0.5073** |
-| Training-data Pearson (5-fold OOF, nested, 732 rows) | **0.8720** |
-| Per-fold RMSE (mean ± std) | 0.5053 ± 0.0425 |
-| Public Kaggle leaderboard score | **0.3605** |
+| Training-data RMSE (5-fold OOF, nested, 732 rows) | **0.4942** |
+| Training-data Pearson (5-fold OOF, nested, 732 rows) | **0.8734** |
+| Public Kaggle leaderboard score | **0.3501** |
 
 | Submission | OOF RMSE | OOF Pearson | Public LB |
 | --- | ---: | ---: | ---: |
@@ -146,22 +155,26 @@ base-model predictions introduce cross-fold dependencies, as detailed in
 | E015, dual large + base | 0.5603 | 0.8336 | 0.3800 |
 | E015, dual + verbatim v2 | 0.5545 | 0.8372 | 0.3778 |
 | E020, + CTC | 0.5466 | 0.8426 | 0.3712 |
-| **E022, + WavLM audio (final)** | **0.5073** | **0.8720** | **0.3605** |
+| E022, + WavLM audio | 0.5073 | 0.8720 | 0.3605 |
+| E023, stronger audio (rejected) | 0.4809 | 0.8862 | 0.3649 |
+| **E024, E022 + calibration (final)** | **0.4942** | **0.8734** | **0.3501** |
 
 The leaderboard score is a separate external signal computed on part of the 216
 test rows and moves by a few thousandths from noise alone, so model selection used
 OOF metrics only (no leaderboard probing or selection by public score). E022 was the
 one exception in spirit: its audio channel is exposed to recording-batch effects that
 random CV cannot rule out (see below), so a single submission at the CV-chosen weight
-served as the external check. OOF RMSE fell 18.2% relative to E008, and E022 is also
-the best public score.
+served as the external check, and the same single-check rule applied to E023 and
+E024. OOF RMSE fell 20.3% relative to E008, and E024 is also the best public score.
 
 **Audio caveat.** Labels of neighbouring file IDs correlate (0.51), so recordings come
 in batches. Grouping folds by file-ID blocks raises the audio-only RMSE from 0.598 to
 0.664–0.719, while a text stand-in loses only about 0.03, and a classifier separates
 train from test audio (AUC ≈ 0.76–0.82). Part of the audio CV gain is therefore batch
-recognition, and 0.507 is optimistic for new recording sources; the public score still
-improved from 0.3712 to 0.3605.
+recognition, and the OOF figures are optimistic for new recording sources; the public
+score still improved from 0.3712 to 0.3605 (E022) and 0.3501 (E024). E023's stronger
+audio (OOF 0.481) earned a 55% weight but scored worse publicly (0.3649), consistent
+with these batch effects, so it was rejected.
 
 ## Repository Structure
 
@@ -208,7 +221,7 @@ python scripts/run_e014_finetune.py --data-dir <Dataset_Final> \
     --gradient-checkpointing --seeds 42 7 2024 --output-dir <runs>
 python scripts/run_e014_ensemble.py --group <run dirs> --group <run dirs> ... --output submission.csv
 python scripts/run_e022_audio.py --runs-dir <runs> --groups large_dual base_dual ... \
-    --audio-dir <WavLM train/test embeddings> --output-dir <out>
+    --audio-dir <WavLM train/test embeddings> --output-dir <out> --calibrate
 ```
 
 WavLM embeddings come from `features/wavlm.py` (E009 extraction for train; the test
@@ -260,7 +273,7 @@ uv run ruff format --check .
 
 GPU modeling/inference additionally requires the ML runtime described in the
 final notebook; the core project environment alone does not provide it.
-Fresh local validation: **753 tests passed** (three warnings). Ruff lint and format checks passed.
+Fresh local validation: **760 tests passed** (three warnings). Ruff lint and format checks passed.
 
 ## Key Findings
 
@@ -274,6 +287,12 @@ Fresh local validation: **753 tests passed** (three warnings). Ruff lint and for
   RBF-SVR blend moved OOF RMSE from 0.5466 to 0.5073 (all five folds) and the public
   score from 0.3712 to 0.3605. The earlier conclusion that audio adds little came from
   an under-regularized Ridge, not from the data.
+- **Calibrate blends, not single models.** Averaging text and audio shrinks predictions;
+  a cross-fitted linear stretch plus clipping improved every fold (0.5073 → 0.4942) and
+  the public score (0.3605 → 0.3501).
+- **Better cross-validated audio is not automatically better.** E023's audio was much
+  stronger in random-fold CV but worse publicly, a reminder that recording-batch
+  effects make audio CV optimistic.
 - Larger encoders and seed averaging helped; a 7B LLM regressor, explicit grammar
   features (GEC edit rate, LLM rubric judge) and fluency features added nothing
   beyond the fine-tuned ensemble.

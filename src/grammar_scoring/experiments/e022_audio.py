@@ -13,6 +13,12 @@ Leakage controls:
 * The blend weight is chosen on the other four folds for each held-out fold
   (nested), and the final weight on all OOF predictions.
 
+E024 adds cross-fitted affine calibration: averaging text and audio predictions
+shrinks them towards the mean, so a line ``label ~ a + b * blend`` fitted on
+the other folds' OOF blend (slope about 1.13) stretches each held-out fold, and
+predictions are clipped to the rubric range [1, 5]. The test calibrator is the
+same line fitted on all OOF blend predictions.
+
 E009 used the same embeddings with ``Ridge(alpha=1.0)``, which is badly
 under-regularized for 768 features and ~585 training rows (OOF RMSE 0.90).
 """
@@ -33,7 +39,11 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.svm import SVR
 
 from grammar_scoring.evaluation.metrics import regression_metrics
-from grammar_scoring.experiments.e014_ensemble import load_groups
+from grammar_scoring.experiments.e014_ensemble import (
+    cross_fitted_calibration,
+    fit_line,
+    load_groups,
+)
 
 PARAM_GRID: dict[str, list[float]] = {
     "svr__C": [1.0, 3.0, 10.0, 30.0],
@@ -41,6 +51,7 @@ PARAM_GRID: dict[str, list[float]] = {
 }
 BLEND_WEIGHTS: NDArray[np.float64] = np.round(np.arange(0.0, 0.71, 0.05), 2)
 SEED = 42
+RUBRIC_RANGE = (1.0, 5.0)
 
 
 def svr_search(n_splits: int) -> GridSearchCV:
@@ -124,6 +135,43 @@ def nested_blend(
     return blended, used
 
 
+def calibrate_oof(
+    blended: NDArray[np.float64], labels: NDArray[np.float64], folds: NDArray
+) -> NDArray[np.float64]:
+    """Cross-fit the affine calibration per fold, then clip to the rubric range.
+
+    Args:
+        blended: Nested OOF blend predictions.
+        labels: Targets.
+        folds: Fold identifier of each row.
+
+    Returns:
+        Calibrated, clipped OOF predictions; fold ``k`` uses a line fitted on
+        the other folds only.
+    """
+    return np.clip(cross_fitted_calibration(blended, labels, folds), *RUBRIC_RANGE)
+
+
+def calibrate_test(
+    blended_oof: NDArray[np.float64],
+    labels: NDArray[np.float64],
+    blended_test: NDArray[np.float64],
+) -> tuple[NDArray[np.float64], tuple[float, float]]:
+    """Apply the line fitted on all OOF blend predictions, then clip.
+
+    Args:
+        blended_oof: Nested OOF blend predictions of the training rows.
+        labels: Training targets.
+        blended_test: Blend predictions for the test rows.
+
+    Returns:
+        ``(calibrated clipped test predictions, (intercept, slope))``.
+    """
+    intercept, slope = fit_line(blended_oof, labels)
+    calibrated = np.clip(intercept + slope * blended_test, *RUBRIC_RANGE)
+    return calibrated, (intercept, slope)
+
+
 def load_audio(
     embeddings_path: Path, metadata_path: Path, filenames: Sequence[str]
 ) -> NDArray[np.floating]:
@@ -162,6 +210,11 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--groups", nargs="+", required=True)
     parser.add_argument("--audio-dir", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument(
+        "--calibrate",
+        action="store_true",
+        help="E024: cross-fitted affine calibration and clipping to [1, 5]",
+    )
     args = parser.parse_args(argv)
 
     groups = {g: sorted((args.runs_dir / g).iterdir()) for g in args.groups}
@@ -186,6 +239,11 @@ def main(argv: Sequence[str] | None = None) -> None:
     weight = best_blend_weight(text_oof, audio_oof, labels)
     final = svr_search(5).fit(train_x, labels)
     prediction = (1 - weight) * text_test + weight * final.predict(test_x)
+    calibration = None
+    final_oof = blended_oof
+    if args.calibrate:
+        final_oof = calibrate_oof(blended_oof, labels, folds)
+        prediction, calibration = calibrate_test(blended_oof, labels, prediction)
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(
@@ -195,18 +253,23 @@ def main(argv: Sequence[str] | None = None) -> None:
             "fold": folds,
             "text": text_oof,
             "audio": audio_oof,
-            "prediction": blended_oof,
+            "blend": blended_oof,
+            "prediction": final_oof,
         }
     ).to_csv(args.output_dir / "oof.csv", index=False)
     pd.DataFrame({"filename": test["filename"], "label": prediction}).to_csv(
         args.output_dir / "submission.csv", index=False
     )
     report = {
-        "experiment": "E022",
+        "experiment": "E024" if args.calibrate else "E022",
         "text_groups": args.groups,
         "text_oof": regression_metrics(labels, text_oof),
         "audio_oof": regression_metrics(labels, audio_oof),
         "blend_oof_nested": regression_metrics(labels, blended_oof),
+        "final_oof": regression_metrics(labels, final_oof),
+        "calibration": None
+        if calibration is None
+        else {"intercept": calibration[0], "slope": calibration[1]},
         "fold_svr_params": fold_params,
         "fold_blend_weights": fold_weights,
         "final_blend_weight": weight,

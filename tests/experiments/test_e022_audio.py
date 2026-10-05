@@ -4,6 +4,8 @@ import pytest
 
 from grammar_scoring.experiments.e022_audio import (
     best_blend_weight,
+    calibrate_oof,
+    calibrate_test,
     load_audio,
     nested_audio_oof,
     nested_blend,
@@ -57,3 +59,26 @@ def test_load_audio_aligns_and_validates(tmp_path):
     np.save(tmp_path / "bad.npy", np.array([[np.nan, 1.0], [2.0, 2.0], [3.0, 3.0]]))
     with pytest.raises(ValueError, match="finite"):
         load_audio(tmp_path / "bad.npy", tmp_path / "m.csv", ["a"])
+
+
+def test_calibrate_oof_is_fold_isolated_and_clipped():
+    rng = np.random.default_rng(3)
+    labels = rng.uniform(1, 5, size=100)
+    blended = 3 + 0.7 * (labels - 3) + rng.normal(scale=0.2, size=100)
+    folds = np.arange(100) % 5
+    corrupted = labels.copy()
+    corrupted[folds == 2] += 50
+    a = calibrate_oof(blended, labels, folds)
+    b = calibrate_oof(blended, corrupted, folds)
+    assert np.allclose(a[folds == 2], b[folds == 2])
+    assert a.min() >= 1 and a.max() <= 5
+    raw = np.sqrt(np.mean((labels - blended) ** 2))
+    assert np.sqrt(np.mean((labels - a) ** 2)) < raw
+
+
+def test_calibrate_test_applies_full_oof_line_and_clips():
+    blended = np.array([2.0, 3.0, 4.0])
+    labels = np.array([1.0, 3.0, 5.0])
+    out, (intercept, slope) = calibrate_test(blended, labels, np.array([3.5, 6.0]))
+    assert (intercept, slope) == pytest.approx((-3.0, 2.0))
+    assert out.tolist() == pytest.approx([4.0, 5.0])
