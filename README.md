@@ -1,10 +1,11 @@
 # Grammar Scoring Engine
 
 An end-to-end speech grammar scoring system that predicts continuous grammar
-scores from spoken English audio. The final model, **E020**, is an equal-weight
-ensemble of fine-tuned DeBERTa-v3 regressors that read three kinds of transcript:
-the default Whisper transcript, disfluency-preserving ("verbatim") Whisper
-transcripts, and a literal wav2vec2 CTC transcript decoded without a language model.
+scores from spoken English audio. The final model, **E022**, blends two channels:
+an equal-weight ensemble of fine-tuned DeBERTa-v3 regressors that read three kinds
+of transcript (default Whisper, disfluency-preserving "verbatim" Whisper, and a
+literal wav2vec2 CTC transcript), and a frozen WavLM audio regressor that hears
+what transcripts lose. Final score = 0.6 × text + 0.4 × audio.
 
 ## Problem
 
@@ -22,7 +23,11 @@ audio (.wav) ──┼─ Whisper large-v3, disfluent prompt   → verbatim v1 �
                ├─ Whisper large-v3, per-window cue     → verbatim v2 ─────────── DeBERTa ─────────┤
                └─ wav2vec2-large CTC, no LM             → literal CTC ─────────── DeBERTa ─────────┤
                                                                                                   ▼
-      equal-weight mean of 6 groups: {large, base} × {dual, v2, CTC}, 2–3 seeds each → grammar score
+      text = equal-weight mean of 6 groups: {large, base} × {dual, v2, CTC}, 2–3 seeds each
+
+audio (.wav) ── frozen WavLM-base-plus (20 s chunks, mean-pooled) ── RBF-SVR ── audio
+
+                     grammar score = 0.6 × text + 0.4 × audio
 ```
 
 **Why verbatim transcripts.** Default Whisper is built to produce clean text: its
@@ -40,6 +45,16 @@ frame and greedy decoding uses no language model, so nothing smooths the words
 spelling errors on accented speech) but its errors differ from Whisper's, which is
 what an ensemble needs. Code:
 [`transcription/ctc.py`](src/grammar_scoring/transcription/ctc.py).
+
+**Why audio.** Transcripts drop pronunciation, rhythm, pauses and self-repairs.
+Frozen `microsoft/wavlm-base-plus` embeddings
+([`features/wavlm.py`](src/grammar_scoring/features/wavlm.py)) feed a standardized
+RBF support-vector regressor
+([`experiments/e022_audio.py`](src/grammar_scoring/experiments/e022_audio.py)).
+The SVR's `C`/`epsilon` are tuned by an inner CV inside each training fold, and the
+40% audio weight is chosen by nested CV (every fold independently picked 0.40–0.45).
+The earlier E009 used the same embeddings with `Ridge(alpha=1.0)`, which is badly
+under-regularized for 768 features and scored only 0.90.
 
 **Models** ([`experiments/e014_finetune.py`](src/grammar_scoring/experiments/e014_finetune.py)).
 Fully fine-tuned `microsoft/deberta-v3-large` (lr 1e-5, layer-wise LR decay 0.9)
@@ -97,7 +112,9 @@ comparable. The matched E005 diagnostic above provides the relevant E008 baselin
 | E019 | + disfluency / fluency / length features | 732 | 0.5642 | 0.8308 | Rejected |
 | E015 | Dual-transcript large ×3 + base ×3 | 732 | 0.5603 | 0.8336 | Superseded |
 | E015 | Dual large/base + verbatim-v2 large/base | 732 | 0.5545 | 0.8372 | Superseded |
-| **E020** | **+ wav2vec2 CTC large/base (6 groups, final)** | **732** | **0.5466** | **0.8426** | **Selected** |
+| E020 | + wav2vec2 CTC large/base (6 text groups) | 732 | 0.5466 | 0.8426 | Superseded |
+| E021 | + RoBERTa-large dual as a 7th text group | 732 | 0.5443 | 0.8442 | Rejected (3/5 folds) |
+| **E022** | **E020 text (60%) + WavLM RBF-SVR audio (40%), nested (final)** | **732** | **0.5073** | **0.8720** | **Selected** |
 
 E014–E019 ran on the same 732 rows and frozen folds as E008, so their OOF numbers
 are directly comparable with it. A candidate was accepted only if it improved pooled
@@ -113,12 +130,12 @@ base-model predictions introduce cross-fold dependencies, as detailed in
 
 ## Results
 
-| Evaluation | Final E020 result |
+| Evaluation | Final E022 result |
 | --- | ---: |
-| Training-data RMSE (5-fold OOF, 732 rows) | **0.5466** |
-| Training-data Pearson (5-fold OOF, 732 rows) | **0.8426** |
-| Per-fold RMSE (mean ± std) | 0.5454 ± 0.0307 |
-| Public Kaggle leaderboard score | **0.3712** |
+| Training-data RMSE (5-fold OOF, nested, 732 rows) | **0.5073** |
+| Training-data Pearson (5-fold OOF, nested, 732 rows) | **0.8720** |
+| Per-fold RMSE (mean ± std) | 0.5053 ± 0.0425 |
+| Public Kaggle leaderboard score | **0.3605** |
 
 | Submission | OOF RMSE | OOF Pearson | Public LB |
 | --- | ---: | ---: | ---: |
@@ -128,12 +145,23 @@ base-model predictions introduce cross-fold dependencies, as detailed in
 | E015, 4 groups | 0.5626 | 0.8319 | 0.3755 |
 | E015, dual large + base | 0.5603 | 0.8336 | 0.3800 |
 | E015, dual + verbatim v2 | 0.5545 | 0.8372 | 0.3778 |
-| **E020, + CTC (final)** | **0.5466** | **0.8426** | **0.3712** |
+| E020, + CTC | 0.5466 | 0.8426 | 0.3712 |
+| **E022, + WavLM audio (final)** | **0.5073** | **0.8720** | **0.3605** |
 
 The leaderboard score is a separate external signal computed on part of the 216
 test rows and moves by a few thousandths from noise alone, so model selection used
-OOF metrics only (no leaderboard probing or selection by public score). OOF RMSE
-fell 11.8% relative to E008, and E020 is also the best public score.
+OOF metrics only (no leaderboard probing or selection by public score). E022 was the
+one exception in spirit: its audio channel is exposed to recording-batch effects that
+random CV cannot rule out (see below), so a single submission at the CV-chosen weight
+served as the external check. OOF RMSE fell 18.2% relative to E008, and E022 is also
+the best public score.
+
+**Audio caveat.** Labels of neighbouring file IDs correlate (0.51), so recordings come
+in batches. Grouping folds by file-ID blocks raises the audio-only RMSE from 0.598 to
+0.664–0.719, while a text stand-in loses only about 0.03, and a classifier separates
+train from test audio (AUC ≈ 0.76–0.82). Part of the audio CV gain is therefore batch
+recognition, and 0.507 is optimistic for new recording sources; the public score still
+improved from 0.3712 to 0.3605.
 
 ## Repository Structure
 
@@ -163,10 +191,11 @@ Credentials must remain external.
 The final report and submission notebook is
 [notebooks/03_final_submission.ipynb](notebooks/03_final_submission.ipynb).
 It recomputes every metric and figure from the stored per-run OOF and test
-predictions and writes the 216-row `submission.csv` (CPU, seconds). Locally it reads
+predictions, refits the small audio SVR, and writes the 216-row `submission.csv`
+(CPU, about a minute). Locally it reads
 `artifacts/final_e015/`; on Kaggle, attach the competition, the private dataset
-`lijoraju94/grammar-scoring-e015-final-artifacts` (per-run predictions plus the
-verbatim and CTC transcripts) and `lijoraju94/grammar-scoring-canonical-artifacts`.
+`lijoraju94/grammar-scoring-e015-final-artifacts` (per-run predictions, the
+verbatim and CTC transcripts, and the WavLM train/test embeddings) and `lijoraju94/grammar-scoring-canonical-artifacts`.
 
 Training each run (GPU; about 6–40 min per seed on a T4):
 
@@ -178,7 +207,13 @@ python scripts/run_e014_finetune.py --data-dir <Dataset_Final> \
     --model-name microsoft/deberta-v3-large --learning-rate 1e-5 --layer-decay 0.9 \
     --gradient-checkpointing --seeds 42 7 2024 --output-dir <runs>
 python scripts/run_e014_ensemble.py --group <run dirs> --group <run dirs> ... --output submission.csv
+python scripts/run_e022_audio.py --runs-dir <runs> --groups large_dual base_dual ... \
+    --audio-dir <WavLM train/test embeddings> --output-dir <out>
 ```
+
+WavLM embeddings come from `features/wavlm.py` (E009 extraction for train; the test
+set was extracted with the same code on Colab and verified to reproduce training
+embeddings at cosine 1.0000).
 
 ### Previous final model (E008)
 
@@ -225,7 +260,7 @@ uv run ruff format --check .
 
 GPU modeling/inference additionally requires the ML runtime described in the
 final notebook; the core project environment alone does not provide it.
-Fresh local validation: **745 tests passed** (three warnings). Ruff lint and format checks passed.
+Fresh local validation: **753 tests passed** (three warnings). Ruff lint and format checks passed.
 
 ## Key Findings
 
@@ -235,14 +270,18 @@ Fresh local validation: **745 tests passed** (three warnings). Ruff lint and for
   OOF RMSE) and large (≈0.594 → 0.580) alike.
 - A literal CTC transcript (no language model) is weaker alone but adds diversity:
   two CTC groups improved OOF RMSE from 0.5545 to 0.5466 across all five folds.
+- **Audio was the largest single gain once modelled properly.** A frozen WavLM +
+  RBF-SVR blend moved OOF RMSE from 0.5466 to 0.5073 (all five folds) and the public
+  score from 0.3712 to 0.3605. The earlier conclusion that audio adds little came from
+  an under-regularized Ridge, not from the data.
 - Larger encoders and seed averaging helped; a 7B LLM regressor, explicit grammar
   features (GEC edit rate, LLM rubric judge) and fluency features added nothing
   beyond the fine-tuned ensemble.
 - Fine-tuning contextual language representations substantially outperformed
   sparse text and frozen embeddings on the full training population.
 - Investigating dataset/source differences materially influenced model selection.
-- Audio features offered complementary OOF information, but fusion gains did not
-  transfer reliably to the public leaderboard.
+- Earlier handcrafted acoustic fusion did not transfer to the leaderboard, largely
+  because it was trained with the zero-label block and learned to spot that batch.
 - E008 was preferred over marginally better stacks with weaker robustness evidence.
 - Reproducibility and artifact provenance validation were first-class requirements.
 
@@ -251,7 +290,9 @@ Fresh local validation: **745 tests passed** (three warnings). Ruff lint and for
 ASR errors propagate into the text model, and verbatim decoding is prompt-driven:
 a few files still contain repetition loops. The ensemble shrinks extreme scores
 towards the mean (weak speakers are over-scored by about 0.6, the strongest
-under-scored by about 0.4). The small dataset and source effects
+under-scored by about 0.4). The audio model partly recognizes recording batches,
+and test audio is partly from different batches; speaker or source IDs would allow
+properly grouped folds. The small dataset and source effects
 limit confidence under distribution shift. Excluding the zero-label block is an
 empirical population decision, not proof of labeling error; E008's OOF metrics
 cover only the retained population. The public leaderboard is one external
