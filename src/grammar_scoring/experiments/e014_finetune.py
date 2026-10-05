@@ -29,6 +29,7 @@ import pandas as pd
 
 if TYPE_CHECKING:
     import torch
+    from transformers import PretrainedConfig
 
 N_FOLDS = 5
 
@@ -51,6 +52,12 @@ class E014Config:
         max_length: Maximum token length (dynamic padding below it).
         warmup_ratio: Fraction of optimizer updates used for linear warmup.
         max_grad_norm: Gradient clipping norm.
+        lora_r: LoRA rank; 0 fine-tunes all weights, >0 trains LoRA adapters on
+            all linear layers of a frozen half-precision backbone (for LLMs).
+        load_in_4bit: Load the frozen backbone in 4-bit NF4 (QLoRA).
+        gradient_checkpointing: Recompute activations to save GPU memory.
+        dual_text: Train on both the primary and alternative transcripts of
+            every training row, and average predictions over both texts.
     """
 
     model_name: str = "microsoft/deberta-v3-base"
@@ -65,12 +72,18 @@ class E014Config:
     max_length: int = 320
     warmup_ratio: float = 0.1
     max_grad_norm: float = 1.0
+    lora_r: int = 0
+    load_in_4bit: bool = False
+    gradient_checkpointing: bool = False
+    dual_text: bool = False
 
     @property
     def run_name(self) -> str:
         """Return a filesystem-safe run identifier."""
         backbone = self.model_name.split("/")[-1]
-        return f"{backbone}_lr{self.learning_rate:g}_s{self.seed}"
+        tags = f"_lora{self.lora_r}" if self.lora_r else ""
+        tags += "_dual" if self.dual_text else ""
+        return f"{backbone}{tags}_lr{self.learning_rate:g}_s{self.seed}"
 
 
 def load_transcripts(path: Path) -> dict[str, str]:
@@ -103,6 +116,8 @@ def build_frames(
     folds_csv: Path,
     train_transcripts: Path,
     test_transcripts: Path,
+    alt_train_transcripts: Path | None = None,
+    alt_test_transcripts: Path | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Assemble the E008 training population and the ordered test frame.
 
@@ -115,10 +130,13 @@ def build_frames(
         folds_csv: Frozen fold assignments with filename, label and fold.
         train_transcripts: Training transcript JSONL.
         test_transcripts: Test transcript JSONL.
+        alt_train_transcripts: Optional alternative training transcripts.
+        alt_test_transcripts: Optional alternative test transcripts.
 
     Returns:
         ``(train, test)``; train has filename, label, fold and text columns,
-        test has filename and text in ``test.csv`` order.
+        test has filename and text in ``test.csv`` order. With alternative
+        transcripts both frames also have a ``text_alt`` column.
 
     Raises:
         ValueError: If identities, labels, folds or transcripts do not align.
@@ -138,12 +156,23 @@ def build_frames(
     train = train.reset_index(drop=True)
     if sorted(train["fold"].unique().tolist()) != list(range(N_FOLDS)):
         raise ValueError(f"Expected folds 0..{N_FOLDS - 1}")
-    for frame, path in ((train, train_transcripts), (test, test_transcripts)):
+    sources = [
+        (train, "text", train_transcripts),
+        (test, "text", test_transcripts),
+    ]
+    if (alt_train_transcripts is None) != (alt_test_transcripts is None):
+        raise ValueError("Alternative transcripts need both train and test files")
+    if alt_train_transcripts is not None and alt_test_transcripts is not None:
+        sources += [
+            (train, "text_alt", alt_train_transcripts),
+            (test, "text_alt", alt_test_transcripts),
+        ]
+    for frame, column, path in sources:
         texts = load_transcripts(path)
         missing = set(frame["filename"]) - set(texts)
         if missing:
             raise ValueError(f"{len(missing)} filenames lack transcripts in {path}")
-        frame["text"] = frame["filename"].map(texts)
+        frame[column] = frame["filename"].map(texts)
     return train, test
 
 
@@ -157,9 +186,12 @@ def seed_everything(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
 
 
-def _build_model(model_name: str) -> torch.nn.Module:
+def _build_model(config: E014Config, device: torch.device) -> torch.nn.Module:
     import torch
     from transformers import AutoConfig, AutoModel
+
+    model_name = config.model_name
+    run_config = config
 
     class Regressor(torch.nn.Module):
         """Backbone, masked mean pooling and a linear regression head."""
@@ -171,10 +203,17 @@ def _build_model(model_name: str) -> torch.nn.Module:
             for key in ("hidden_dropout_prob", "attention_probs_dropout_prob"):
                 if hasattr(config, key):
                     setattr(config, key, 0.0)
-            self.backbone = AutoModel.from_pretrained(
-                model_name, config=config, torch_dtype=torch.float32
-            )
-            self.head = torch.nn.Linear(config.hidden_size, 1)
+            if run_config.lora_r:
+                self.backbone = _lora_backbone(run_config, config, device)
+            else:
+                self.backbone = AutoModel.from_pretrained(
+                    model_name, config=config, torch_dtype=torch.float32
+                ).to(device)
+                if run_config.gradient_checkpointing:
+                    self.backbone.gradient_checkpointing_enable(
+                        gradient_checkpointing_kwargs={"use_reentrant": False}
+                    )
+            self.head = torch.nn.Linear(config.hidden_size, 1).to(device)
 
         def forward(
             self, input_ids: torch.Tensor, attention_mask: torch.Tensor
@@ -184,9 +223,57 @@ def _build_model(model_name: str) -> torch.nn.Module:
             ).last_hidden_state
             mask = attention_mask.unsqueeze(-1).to(states.dtype)
             pooled = (states * mask).sum(1) / mask.sum(1).clamp_min(1)
-            return self.head(pooled).squeeze(-1)
+            return self.head(pooled.float()).squeeze(-1)
 
     return Regressor()
+
+
+def _lora_backbone(
+    run_config: E014Config, model_config: PretrainedConfig, device: torch.device
+) -> torch.nn.Module:
+    """Load a frozen half-precision (or 4-bit) backbone with fp32 LoRA adapters."""
+    import torch
+    from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+    from transformers import AutoModel, BitsAndBytesConfig
+
+    kwargs: dict[str, Any] = {"torch_dtype": torch.float16}
+    if run_config.load_in_4bit:
+        kwargs["quantization_config"] = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.float16,
+            bnb_4bit_use_double_quant=True,
+        )
+    backbone = AutoModel.from_pretrained(
+        run_config.model_name,
+        config=model_config,
+        device_map={"": device.index or 0},
+        **kwargs,
+    )
+    if run_config.load_in_4bit:
+        backbone = prepare_model_for_kbit_training(
+            backbone,
+            use_gradient_checkpointing=run_config.gradient_checkpointing,
+            gradient_checkpointing_kwargs={"use_reentrant": False},
+        )
+    elif run_config.gradient_checkpointing:
+        backbone.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False}
+        )
+    backbone = get_peft_model(
+        backbone,
+        LoraConfig(
+            r=run_config.lora_r,
+            lora_alpha=2 * run_config.lora_r,
+            lora_dropout=0.05,
+            target_modules="all-linear",
+        ),
+    )
+    # GradScaler cannot unscale fp16 gradients: keep every trainable tensor fp32.
+    for parameter in backbone.parameters():
+        if parameter.requires_grad:
+            parameter.data = parameter.data.float()
+    return backbone
 
 
 def layer_depth(name: str, n_layers: int) -> int:
@@ -227,6 +314,8 @@ def parameter_groups(
     n_layers = int(model.backbone.config.num_hidden_layers)
     groups: dict[tuple[float, float], list[Any]] = {}
     for name, parameter in model.named_parameters():
+        if not parameter.requires_grad:
+            continue
         if name.startswith("head."):
             lr = config.head_learning_rate
         else:
@@ -327,7 +416,9 @@ def train_fold(
 
     seed_everything(config.seed + fold)
     tokenizer = AutoTokenizer.from_pretrained(config.model_name)
-    pad_id = tokenizer.pad_token_id or 0
+    pad_id = tokenizer.pad_token_id
+    if pad_id is None:
+        pad_id = tokenizer.eos_token_id or 0
 
     def encode(texts: pd.Series) -> list[list[int]]:
         return tokenizer(texts.tolist(), max_length=config.max_length, truncation=True)[
@@ -336,15 +427,21 @@ def train_fold(
 
     is_valid = train["fold"].to_numpy() == fold
     fit, valid = train[~is_valid], train[is_valid]
-    fit_enc, valid_enc, test_enc = (
-        encode(fit.text),
-        encode(valid.text),
-        encode(test.text),
-    )
-    fit_y = fit["label"].to_numpy(dtype=np.float64)
+    # Each evaluation set is a list of encodings whose predictions are averaged.
+    columns = ["text", "text_alt"] if config.dual_text else ["text"]
+    fit_enc = [ids for column in columns for ids in encode(fit[column])]
+    valid_enc = [encode(valid[column]) for column in columns]
+    test_enc = [encode(test[column]) for column in columns]
+    fit_y = np.tile(fit["label"].to_numpy(dtype=np.float64), len(columns))
     valid_y = valid["label"].to_numpy(dtype=np.float64)
 
-    model = _build_model(config.model_name).to(device)
+    model = _build_model(config, device)
+
+    def predict_all(
+        net: torch.nn.Module, encodings: list[list[list[int]]]
+    ) -> np.ndarray:
+        return np.mean([_predict(net, e, pad_id, device) for e in encodings], 0)
+
     # Start the head at the training mean so early updates are not wasted.
     with torch.no_grad():
         model.head.bias.fill_(float(fit_y.mean()))
@@ -386,7 +483,7 @@ def train_fold(
                 scaler.update()
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
-        valid_pred = _predict(model, valid_enc, pad_id, device)
+        valid_pred = predict_all(model, valid_enc)
         row = {
             "fold": fold,
             "epoch": epoch,
@@ -396,7 +493,7 @@ def train_fold(
         }
         history.append(row)
         print(json.dumps(row), flush=True)
-        last = {"valid": valid_pred, "test": _predict(model, test_enc, pad_id, device)}
+        last = {"valid": valid_pred, "test": predict_all(model, test_enc)}
         if best is None or row["valid_rmse"] < best["valid_rmse"]:
             best = {"epoch": epoch, "valid_rmse": row["valid_rmse"], **last}
     assert best is not None
@@ -502,6 +599,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--grad-accum", type=int, default=2)
     parser.add_argument("--max-length", type=int, default=320)
+    parser.add_argument("--alt-transcript-dir", type=Path)
+    parser.add_argument("--lora-r", type=int, default=0)
+    parser.add_argument("--load-in-4bit", action="store_true")
+    parser.add_argument("--gradient-checkpointing", action="store_true")
     return parser.parse_args(argv)
 
 
@@ -514,6 +615,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         args.transcript_dir / "train_folds.csv",
         args.transcript_dir / "train.jsonl",
         args.transcript_dir / "test.jsonl",
+        args.alt_transcript_dir / "train.jsonl" if args.alt_transcript_dir else None,
+        args.alt_transcript_dir / "test.jsonl" if args.alt_transcript_dir else None,
     )
     print(f"train rows={len(train)} test rows={len(test)}", flush=True)
     for seed in args.seeds:
@@ -527,6 +630,10 @@ def main(argv: Sequence[str] | None = None) -> None:
             batch_size=args.batch_size,
             grad_accum=args.grad_accum,
             max_length=args.max_length,
+            lora_r=args.lora_r,
+            load_in_4bit=args.load_in_4bit,
+            gradient_checkpointing=args.gradient_checkpointing,
+            dual_text=args.alt_transcript_dir is not None,
         )
         run(train, test, config, args.output_dir)
 
