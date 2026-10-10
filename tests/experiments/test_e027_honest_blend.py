@@ -8,6 +8,7 @@ from grammar_scoring.experiments.e027_honest_blend import (
     grouped_ridge_oof,
     importance_weights,
     nested_honest_blend,
+    ridge_channel,
     ridge_fit_predict,
     simplex_grid,
     speaker_groups,
@@ -101,3 +102,21 @@ def test_nested_honest_blend_ignores_held_out_and_seen_rows():
     apply = mask & (folds == 1)
     assert np.allclose(base[apply], other[apply])
     assert np.isnan(base[~mask]).all() and len(chosen) == 5
+
+
+def test_ridge_channel_averages_feature_sets_and_aligns_rows():
+    rng = np.random.default_rng(4)
+    labels = rng.normal(size=40)
+    groups = np.arange(40) % 10
+    data = {}
+    for name in ("a", "b"):
+        data[f"{name}_train"] = np.vstack(
+            [np.zeros((1, 3)), labels[:, None] + rng.normal(scale=0.05, size=(40, 3))]
+        )
+        data[f"{name}_test"] = np.array([[1.0, 1.0, 1.0], [-1.0, -1.0, -1.0]])
+    rows = np.arange(1, 41)  # skip the padding row
+    oof, test = ridge_channel(
+        data, ("a", "b"), rows, np.array([1, 0]), labels, groups, 1.0
+    )
+    assert np.corrcoef(oof, labels)[0, 1] > 0.95
+    assert test[0] < 0 < test[1]

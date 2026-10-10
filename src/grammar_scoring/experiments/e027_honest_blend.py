@@ -171,6 +171,38 @@ def ridge_fit_predict(
     return model.predict(scaler.transform(test_x))
 
 
+def ridge_channel(
+    data: dict[str, NDArray],
+    names: Sequence[str],
+    rows: NDArray[np.int64],
+    test_rows: NDArray[np.int64],
+    labels: NDArray[np.floating],
+    groups: NDArray,
+    alpha: float,
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    """Build one channel as the mean of Ridge models over several feature sets.
+
+    Args:
+        data: Packed features with ``<name>_train`` and ``<name>_test`` arrays.
+        names: Feature sets averaged into the channel.
+        rows: Training rows of ``data`` to use, in label order.
+        test_rows: Test rows of ``data`` to use, in submission order.
+        labels: Training targets.
+        groups: Speaker group per training row.
+        alpha: Ridge regularization strength.
+
+    Returns:
+        ``(speaker-grouped OOF predictions, test predictions)``; the test
+        models are fitted on all training rows.
+    """
+    grouped, final = [], []
+    for name in names:
+        train_x, test_x = data[f"{name}_train"][rows], data[f"{name}_test"][test_rows]
+        grouped.append(grouped_ridge_oof(train_x, labels, groups, alpha))
+        final.append(ridge_fit_predict(train_x, labels, test_x, alpha))
+    return np.mean(grouped, axis=0), np.mean(final, axis=0)
+
+
 def simplex_grid(n_channels: int, step: float = WEIGHT_STEP) -> NDArray[np.float64]:
     """Return all non-negative weight vectors on a grid that sum to one."""
     ticks = np.round(np.arange(0.0, 1.0 + step / 2, step), 10)
@@ -287,19 +319,12 @@ def main(argv: Sequence[str] | None = None) -> None:
     mask = unseen_speaker_mask(groups, folds)
     weights = importance_weights(short, mask, float(test_short.mean()))
 
-    def channel(names: Sequence[str], alpha: float) -> tuple[NDArray, NDArray]:
-        grouped, final = [], []
-        for name in names:
-            train_x, test_x = (
-                data[f"{name}_train"][rows],
-                data[f"{name}_test"][test_rows],
-            )
-            grouped.append(grouped_ridge_oof(train_x, labels, groups, alpha))
-            final.append(ridge_fit_predict(train_x, labels, test_x, alpha))
-        return np.mean(grouped, axis=0), np.mean(final, axis=0)
-
-    audio_oof, audio_test = channel(AUDIO_FEATURES, AUDIO_ALPHA)
-    voxtral_oof, voxtral_test = channel((VOXTRAL_FEATURE,), VOXTRAL_ALPHA)
+    audio_oof, audio_test = ridge_channel(
+        data, AUDIO_FEATURES, rows, test_rows, labels, groups, AUDIO_ALPHA
+    )
+    voxtral_oof, voxtral_test = ridge_channel(
+        data, (VOXTRAL_FEATURE,), rows, test_rows, labels, groups, VOXTRAL_ALPHA
+    )
     channels = np.column_stack(
         [oof[args.groups].mean(axis=1).to_numpy(), audio_oof, voxtral_oof]
     )

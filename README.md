@@ -1,12 +1,12 @@
 # Grammar Scoring Engine
 
 An end-to-end speech grammar scoring system that predicts continuous grammar
-scores from spoken English audio. The final model, **E024**, blends two channels:
-an equal-weight ensemble of fine-tuned DeBERTa-v3 regressors that read three kinds
-of transcript (default Whisper, disfluency-preserving "verbatim" Whisper, and a
-literal wav2vec2 CTC transcript), and a frozen WavLM audio regressor that hears
-what transcripts lose. The 0.6 × text + 0.4 × audio blend is then stretched by a
-cross-fitted linear calibration and clipped to the rubric range [1, 5].
+scores from spoken English audio. The final model, **E027**, is a calibrated blend of
+three channels: an ensemble of fine-tuned DeBERTa-v3 regressors that read several
+kinds of transcript (40%), Ridge regressions on frozen WavLM-large and Whisper-encoder
+audio states (30%), and a Ridge on the hidden states of the Voxtral audio language
+model (30%). Blend weights and calibration are fitted only on predictions for
+**speakers the models never heard**, weighted to the test set's mix of recordings.
 
 ## Problem
 
@@ -26,9 +26,11 @@ audio (.wav) ──┼─ Whisper large-v3, disfluent prompt   → verbatim v1 �
                                                                                                   ▼
       text = equal-weight mean of 6 groups: {large, base} × {dual, v2, CTC}, 2–3 seeds each
 
-audio (.wav) ── frozen WavLM-base-plus (20 s chunks, mean-pooled) ── RBF-SVR ── audio
+audio (.wav) ─┬─ WavLM-large layer 20 ──────────── Ridge ─┐
+              ├─ Whisper encoder layers 22–32 ──── Ridge ─┴─ mean ─ audio
+              └─ Voxtral-Mini-3B (audio + question), layers 12–14 ── Ridge ─ voxtral
 
-      grammar score = clip(−0.480 + 1.135 × (0.6 × text + 0.4 × audio), 1, 5)
+   grammar score = clip(−0.441 + 1.109 × (0.40 × text + 0.30 × audio + 0.30 × voxtral), 1, 5)
 ```
 
 **Why verbatim transcripts.** Default Whisper is built to produce clean text: its
@@ -47,22 +49,30 @@ spelling errors on accented speech) but its errors differ from Whisper's, which 
 what an ensemble needs. Code:
 [`transcription/ctc.py`](src/grammar_scoring/transcription/ctc.py).
 
-**Why audio.** Transcripts drop pronunciation, rhythm, pauses and self-repairs.
-Frozen `microsoft/wavlm-base-plus` embeddings
-([`features/wavlm.py`](src/grammar_scoring/features/wavlm.py)) feed a standardized
-RBF support-vector regressor
-([`experiments/e022_audio.py`](src/grammar_scoring/experiments/e022_audio.py)).
-The SVR's `C`/`epsilon` are tuned by an inner CV inside each training fold, and the
-40% audio weight is chosen by nested CV (every fold independently picked 0.40–0.45).
-The earlier E009 used the same embeddings with `Ridge(alpha=1.0)`, which is badly
-under-regularized for 768 features and scored only 0.90.
+**Why audio, and why frozen models.** Transcripts drop pronunciation, rhythm, pauses
+and self-repairs, and raters hear them. With 732 clips a speech model cannot be
+trained, so large pretrained models stay frozen and only small Ridge regressors learn
+from their time-averaged states: WavLM-large layer 20 and Whisper-encoder layers 22–32
+([`features/audio_layers.py`](src/grammar_scoring/features/audio_layers.py)), and
+Voxtral-Mini-3B LLM layers 12–14 at the audio-token positions, where the model is
+given the clip together with the question "How accurate and complex is the speaker's
+grammar?" ([`features/speaker_voxtral.py`](src/grammar_scoring/features/speaker_voxtral.py)).
 
-**Why calibration (E024).** Averaging two channels pulls predictions towards the
-mean. For each fold, a line `label ≈ a + b × blend` fitted on the other folds' OOF
-blend stretches the held-out fold (slopes 1.12–1.15 in every fold), and predictions
-are clipped to [1, 5]; the test line is fitted on all OOF blend predictions. This
-idea comes from a top public solution; it did not help the text-only ensemble, whose
-predictions were already well scaled.
+**Why speaker-honest validation.** Clips are grouped into speakers by voice similarity
+(x-vectors, cosine > 0.93). 69% of training clips have another clip by the same speaker
+with almost the same score (spread 0.19 within a speaker, 1.01 overall), but only 13%
+of test clips match a training speaker. Random folds therefore let models score a clip
+by recognizing its speaker: the text ensemble's RMSE is 0.521 when the speaker is also
+in the training folds and 0.591 when not, and an earlier audio model (RBF-SVR, last
+WavLM layer) went from 0.50 to 0.73. In addition, recordings shorter than 50 s are 24%
+of the training set but 69% of the test set. E027
+([`experiments/e027_honest_blend.py`](src/grammar_scoring/experiments/e027_honest_blend.py))
+validates the audio channels with speaker-grouped folds and fits blend weights and the
+calibration line on unseen-speaker rows weighted to the test share of short clips.
+
+**Why calibration.** Averaging channels pulls predictions towards the mean; a weighted
+line `label ≈ a + b × blend` (slope 1.11) stretches them back and predictions are
+clipped to the rubric range [1, 5].
 
 **Models** ([`experiments/e014_finetune.py`](src/grammar_scoring/experiments/e014_finetune.py)).
 Fully fine-tuned `microsoft/deberta-v3-large` (lr 1e-5, layer-wise LR decay 0.9)
@@ -124,7 +134,10 @@ comparable. The matched E005 diagnostic above provides the relevant E008 baselin
 | E021 | + RoBERTa-large dual as a 7th text group | 732 | 0.5443 | 0.8442 | Rejected (3/5 folds) |
 | E022 | E020 text (60%) + WavLM RBF-SVR audio (40%), nested | 732 | 0.5073 | 0.8720 | Superseded |
 | E023 | E020 text + WavLM-large & Whisper-encoder audio (55%) | 732 | 0.4809 | 0.8862 | Rejected (LB 0.3649) |
-| **E024** | **E022 + cross-fitted calibration, clip [1, 5] (final)** | **732** | **0.4942** | **0.8734** | **Selected** |
+| E024 | E022 + cross-fitted calibration, clip [1, 5] | 732 | 0.4942 | 0.8734 | Superseded |
+| E025 | E023 audio, blend and calibration per duration batch | 732 | 0.4628 | 0.8900 | Rejected (LB tie; leaky validation) |
+| E026 | Text + Ridge audio on upper layers, speaker-honest fit | 255 unseen | 0.549 (honest) | — | Superseded |
+| **E027** | **E026 + Voxtral audio-LLM channel (final)** | **255 unseen** | **0.544 (honest)** | **0.836** | **Selected** |
 
 E014–E019 ran on the same 732 rows and frozen folds as E008, so their OOF numbers
 are directly comparable with it. A candidate was accepted only if it improved pooled
@@ -140,41 +153,36 @@ base-model predictions introduce cross-fold dependencies, as detailed in
 
 ## Results
 
-| Evaluation | Final E024 result |
+| Evaluation on the training data | Final E027 result |
 | --- | ---: |
-| Training-data RMSE (5-fold OOF, nested, 732 rows) | **0.4942** |
-| Training-data Pearson (5-fold OOF, nested, 732 rows) | **0.8734** |
-| Public Kaggle leaderboard score | **0.3501** |
+| **RMSE, unseen speakers at the test mix (honest estimate)** | **0.544** |
+| RMSE / Pearson, unseen speakers, unweighted (255 rows) | 0.545 / 0.836 |
+| RMSE / Pearson, all 732 rows, cross-validated (optimistic) | 0.508 / 0.868 |
+| Public Kaggle leaderboard score | **0.3362** |
 
-| Submission | OOF RMSE | OOF Pearson | Public LB |
+"Honest" means every clip is scored by models that never heard its speaker, with short
+and long clips weighted as in the test set. The all-rows figure is optimistic because
+the fine-tuned text models saw other clips by the same speakers.
+
+| Submission | Random-fold OOF RMSE | Honest RMSE | Public LB |
 | --- | ---: | ---: | ---: |
-| E008 | 0.6198 | 0.7942 | 0.3925 |
-| E014 | 0.5732 | 0.8250 | 0.3894 |
-| E015, 3 groups | 0.5670 | 0.8290 | 0.3816 |
-| E015, 4 groups | 0.5626 | 0.8319 | 0.3755 |
-| E015, dual large + base | 0.5603 | 0.8336 | 0.3800 |
-| E015, dual + verbatim v2 | 0.5545 | 0.8372 | 0.3778 |
-| E020, + CTC | 0.5466 | 0.8426 | 0.3712 |
-| E022, + WavLM audio | 0.5073 | 0.8720 | 0.3605 |
-| E023, stronger audio (rejected) | 0.4809 | 0.8862 | 0.3649 |
-| **E024, E022 + calibration (final)** | **0.4942** | **0.8734** | **0.3501** |
+| E008 DeBERTa-base, canonical transcript | 0.6198 | — | 0.3925 |
+| E014 multi-seed base and large | 0.5732 | — | 0.3894 |
+| E015 + verbatim transcripts | 0.5545 | — | 0.3778 |
+| E020 + CTC transcripts | 0.5466 | 0.590 | 0.3712 |
+| E022 + WavLM audio (RBF-SVR, random folds) | 0.5073 | 0.588 | 0.3605 |
+| E023 stronger audio, same validation (rejected) | 0.4809 | — | 0.3649 |
+| E024 + calibration | 0.4942 | 0.579 | 0.3501 |
+| E025 per-duration blend (rejected) | 0.4628 | — | 0.3499 |
+| E026 honest audio | — | 0.549 | 0.3448 |
+| **E027 + Voxtral (final)** | — | **0.544** | **0.3362** |
 
-The leaderboard score is a separate external signal computed on part of the 216
-test rows and moves by a few thousandths from noise alone, so model selection used
-OOF metrics only (no leaderboard probing or selection by public score). E022 was the
-one exception in spirit: its audio channel is exposed to recording-batch effects that
-random CV cannot rule out (see below), so a single submission at the CV-chosen weight
-served as the external check, and the same single-check rule applied to E023 and
-E024. OOF RMSE fell 20.3% relative to E008, and E024 is also the best public score.
-
-**Audio caveat.** Labels of neighbouring file IDs correlate (0.51), so recordings come
-in batches. Grouping folds by file-ID blocks raises the audio-only RMSE from 0.598 to
-0.664–0.719, while a text stand-in loses only about 0.03, and a classifier separates
-train from test audio (AUC ≈ 0.76–0.82). Part of the audio CV gain is therefore batch
-recognition, and the OOF figures are optimistic for new recording sources; the public
-score still improved from 0.3712 to 0.3605 (E022) and 0.3501 (E024). E023's stronger
-audio (OOF 0.481) earned a 55% weight but scored worse publicly (0.3649), consistent
-with these batch effects, so it was rejected.
+Up to E024, models were selected on random-fold out-of-fold metrics. Those numbers kept
+improving while the leaderboard reacted less and less (E023 and E025 improved the
+random-fold RMSE a lot and the public score not at all), which led to the speaker and
+test-mix analysis. From E026 on, the honest estimate and the leaderboard move together.
+No blend weight or calibration parameter was ever tuned on the leaderboard; each
+candidate got a single submission.
 
 ## Repository Structure
 
@@ -203,30 +211,34 @@ Credentials must remain external.
 
 The final report and submission notebook is
 [notebooks/03_final_submission.ipynb](notebooks/03_final_submission.ipynb).
-It recomputes every metric and figure from the stored per-run OOF and test
-predictions, refits the small audio SVR, and writes the 216-row `submission.csv`
-(CPU, about a minute). Locally it reads
-`artifacts/final_e015/`; on Kaggle, attach the competition, the private dataset
-`lijoraju94/grammar-scoring-e015-final-artifacts` (per-run predictions, the
-verbatim and CTC transcripts, and the WavLM train/test embeddings) and `lijoraju94/grammar-scoring-canonical-artifacts`.
-
-Training each run (GPU; about 6–40 min per seed on a T4):
+It recomputes every metric and figure from the stored per-run text predictions and
+the packed frozen features, refits the small Ridge models, and writes the 216-row
+`submission.csv` (CPU, about a minute). Locally it reads `artifacts/final_e015/`; on
+Kaggle, attach the competition, the private dataset
+`lijoraju94/grammar-scoring-e015-final-artifacts` (per-run predictions, transcripts and
+`features_e027.npz`) and `lijoraju94/grammar-scoring-canonical-artifacts`.
 
 ```sh
+# transcripts and text models (GPU; about 6–40 min per seed on a T4)
 python scripts/transcribe_verbatim.py --data-dir <Dataset_Final> --output-dir <out> --variant v1
 python scripts/transcribe_ctc.py --data-dir <Dataset_Final> --output-dir <ctc_out>
 python scripts/run_e014_finetune.py --data-dir <Dataset_Final> \
     --transcript-dir <canonical> --alt-transcript-dir <verbatim_v1> \
     --model-name microsoft/deberta-v3-large --learning-rate 1e-5 --layer-decay 0.9 \
     --gradient-checkpointing --seeds 42 7 2024 --output-dir <runs>
-python scripts/run_e014_ensemble.py --group <run dirs> --group <run dirs> ... --output submission.csv
-python scripts/run_e022_audio.py --runs-dir <runs> --groups large_dual base_dual ... \
-    --audio-dir <WavLM train/test embeddings> --output-dir <out> --calibrate
+# frozen audio features (GPU, once)
+python scripts/extract_audio_layers.py --data-dir <Dataset_Final> --output-dir <layers>
+python -m grammar_scoring.features.speaker_voxtral --data-dir <Dataset_Final> \
+    --output-dir <e026> --what speaker voxtral
+# speaker-honest evaluation, blend, calibration and submission (CPU)
+python scripts/run_e027_honest_blend.py --runs-dir <runs> \
+    --groups large_dual base_dual large_v2 base_v2 large_ctc base_ctc \
+    --features <features.npz> --output-dir <out>
 ```
 
-WavLM embeddings come from `features/wavlm.py` (E009 extraction for train; the test
-set was extracted with the same code on Colab and verified to reproduce training
-embeddings at cosine 1.0000).
+`features.npz` packs, per recording, the selected layer averages (WavLM-large layer 20,
+Whisper-encoder layers 22–32, Voxtral layers 12–14), the speaker x-vector and the
+duration.
 
 ### Previous final model (E008)
 
@@ -273,49 +285,41 @@ uv run ruff format --check .
 
 GPU modeling/inference additionally requires the ML runtime described in the
 final notebook; the core project environment alone does not provide it.
-Fresh local validation: **760 tests passed** (three warnings). Ruff lint and format checks passed.
+Fresh local validation: **772 tests passed** (three warnings). Ruff lint and format checks passed.
 
 ## Key Findings
 
-- **The transcript is the bottleneck.** Verbatim Whisper decoding, which keeps
-  disfluencies and uncorrected errors, gave the largest consistent gains; training
-  each model on both transcripts of a clip helped base (≈0.605 → 0.583 seed-mean
-  OOF RMSE) and large (≈0.594 → 0.580) alike.
-- A literal CTC transcript (no language model) is weaker alone but adds diversity:
-  two CTC groups improved OOF RMSE from 0.5545 to 0.5466 across all five folds.
-- **Audio was the largest single gain once modelled properly.** A frozen WavLM +
-  RBF-SVR blend moved OOF RMSE from 0.5466 to 0.5073 (all five folds) and the public
-  score from 0.3712 to 0.3605. The earlier conclusion that audio adds little came from
-  an under-regularized Ridge, not from the data.
-- **Calibrate blends, not single models.** Averaging text and audio shrinks predictions;
-  a cross-fitted linear stretch plus clipping improved every fold (0.5073 → 0.4942) and
-  the public score (0.3605 → 0.3501).
-- **Better cross-validated audio is not automatically better.** E023's audio was much
-  stronger in random-fold CV but worse publicly, a reminder that recording-batch
-  effects make audio CV optimistic.
-- Larger encoders and seed averaging helped; a 7B LLM regressor, explicit grammar
-  features (GEC edit rate, LLM rubric judge) and fluency features added nothing
-  beyond the fine-tuned ensemble.
-- Fine-tuning contextual language representations substantially outperformed
-  sparse text and frozen embeddings on the full training population.
-- Investigating dataset/source differences materially influenced model selection.
-- Earlier handcrafted acoustic fusion did not transfer to the leaderboard, largely
-  because it was trained with the zero-label block and learned to spot that batch.
-- E008 was preferred over marginally better stacks with weaker robustness evidence.
-- Reproducibility and artifact provenance validation were first-class requirements.
+- **Validate the way the test set is built.** Speakers repeat in training and are
+  mostly new in the test set, and the test set has far more short recordings. Random
+  folds overstated every model, most of all audio models that can recognize voices.
+  Switching to unseen-speaker, test-mix validation changed which audio model was best
+  and moved the public score from 0.3501 to 0.3362.
+- **The transcript matters.** Verbatim Whisper decoding, which keeps disfluencies and
+  uncorrected errors, and a literal CTC transcript each improved the text ensemble.
+- **Frozen models plus small regressors generalize to new speakers.** Upper layers
+  with a strongly regularized Ridge beat a flexible RBF-SVR, which memorized voices.
+  An audio language model (Voxtral) was the strongest single channel on new speakers
+  (0.553 speaker-grouped RMSE) and is equally good on short and long clips.
+- **Calibrate blends.** Averaging channels shrinks predictions; a fitted line plus
+  clipping to the rubric range corrects it.
+- **Negative results.** A 7B LLM regressor, GEC edit rates, an LLM rubric judge,
+  fluency features, RoBERTa, tree stackers, rounding and test-time audio
+  normalization added nothing; see [docs/E014_E027.md](docs/E014_E027.md).
+- A speaker's known score would improve the 13% of test clips that match a training
+  speaker, but that is speaker recognition, not grammar scoring, and is left out.
 
 ## Limitations
 
-ASR errors propagate into the text model, and verbatim decoding is prompt-driven:
-a few files still contain repetition loops. The ensemble shrinks extreme scores
-towards the mean (weak speakers are over-scored by about 0.6, the strongest
-under-scored by about 0.4). The audio model partly recognizes recording batches,
-and test audio is partly from different batches; speaker or source IDs would allow
-properly grouped folds. The small dataset and source effects
-limit confidence under distribution shift. Excluding the zero-label block is an
-empirical population decision, not proof of labeling error; E008's OOF metrics
-cover only the retained population. The public leaderboard is one external
-signal and does not establish general performance across speakers or sources.
+The honest validation set is small (255 unseen-speaker rows), so the blend and the
+honest RMSE carry about ±0.01 of fold-assignment noise. The fine-tuned text models
+were trained on random folds and saw other clips by the same speakers; retraining them
+on speaker-grouped folds would make every row's prediction honest. Speaker grouping
+relies on a voice-similarity threshold and is approximate. ASR errors propagate into
+the text models, and verbatim decoding is prompt-driven. The blend still shrinks
+extreme scores towards the middle; only four training clips score below 2. Excluding
+the 37 zero-label clips is an empirical decision about a noisy batch (a CTC model hears
+no speech in about half of them), not proof of labelling error. The public leaderboard
+is one external signal on part of 216 clips.
 
 ## Reproducibility
 
