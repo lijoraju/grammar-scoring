@@ -600,6 +600,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--grad-accum", type=int, default=2)
     parser.add_argument("--max-length", type=int, default=320)
     parser.add_argument("--alt-transcript-dir", type=Path)
+    parser.add_argument(
+        "--folds-csv",
+        type=Path,
+        help="Fold assignments (default: <transcript-dir>/train_folds.csv)",
+    )
     parser.add_argument("--lora-r", type=int, default=0)
     parser.add_argument("--load-in-4bit", action="store_true")
     parser.add_argument("--gradient-checkpointing", action="store_true")
@@ -612,7 +617,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     train, test = build_frames(
         args.data_dir / "train.csv",
         args.data_dir / "test.csv",
-        args.transcript_dir / "train_folds.csv",
+        args.folds_csv or args.transcript_dir / "train_folds.csv",
         args.transcript_dir / "train.jsonl",
         args.transcript_dir / "test.jsonl",
         args.alt_transcript_dir / "train.jsonl" if args.alt_transcript_dir else None,

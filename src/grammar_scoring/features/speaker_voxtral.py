@@ -31,6 +31,12 @@ SPEAKER_MODEL = "microsoft/wavlm-base-plus-sv"
 SPEAKER_WINDOW_SECONDS = 10
 VOXTRAL_MODEL = "mistralai/Voxtral-Mini-3B-2507"
 VOXTRAL_QUESTION = "How accurate and complex is the speaker's grammar?"
+# Alternative questions give further "views" of the same audio (E028).
+VOXTRAL_QUESTIONS = {
+    "grammar": VOXTRAL_QUESTION,
+    "errors": "What grammatical errors does the speaker make?",
+    "structure": "Does the speaker use correct sentence structure and verb forms?",
+}
 
 
 def read_wav(path: Path) -> NDArray[np.float32]:
@@ -121,8 +127,20 @@ def extract_speaker(files: Sequence[Path], output: Path) -> None:
     )
 
 
-def extract_voxtral(files: Sequence[Path], output: Path) -> None:
-    """Save per-layer means of Voxtral states over the audio-token positions."""
+def extract_voxtral(
+    files: Sequence[Path],
+    output: Path,
+    question: str = VOXTRAL_QUESTION,
+    layers: Sequence[int] | None = None,
+) -> None:
+    """Save per-layer means of Voxtral states over the audio-token positions.
+
+    Args:
+        files: WAV paths.
+        output: Destination ``.npz``.
+        question: Text question given to the model together with the audio.
+        layers: Hidden-state indices to keep (all layers when ``None``).
+    """
     import torch
     from transformers import AutoProcessor, VoxtralForConditionalGeneration
 
@@ -139,7 +157,7 @@ def extract_voxtral(files: Sequence[Path], output: Path) -> None:
                 "role": "user",
                 "content": [
                     {"type": "audio", "path": str(path)},
-                    {"type": "text", "text": VOXTRAL_QUESTION},
+                    {"type": "text", "text": question},
                 ],
             }
         ]
@@ -150,10 +168,11 @@ def extract_voxtral(files: Sequence[Path], output: Path) -> None:
         positions = inputs["input_ids"][0] == audio_token_id
         if not bool(positions.any()):
             raise RuntimeError(f"No audio tokens found for {path.name}")
-        layers = torch.stack(states)[:, 0][:, positions].float().mean(dim=1)
-        if not bool(torch.isfinite(layers).all()):
+        means = torch.stack(states)[:, 0][:, positions].float().mean(dim=1)
+        if not bool(torch.isfinite(means).all()):
             raise FloatingPointError(f"Non-finite Voxtral states for {path.name}")
-        rows.append(layers.cpu().numpy().astype(np.float16))
+        kept = means if layers is None else means[list(layers)]
+        rows.append(kept.cpu().numpy().astype(np.float16))
         counts.append(int(positions.sum()))
         if index % 50 == 0:
             rate = (time.time() - started) / index
@@ -163,7 +182,8 @@ def extract_voxtral(files: Sequence[Path], output: Path) -> None:
         filenames=np.array([p.name for p in files]),
         mean=np.stack(rows),
         audio_tokens=np.array(counts),
-        question=np.array(VOXTRAL_QUESTION),
+        question=np.array(question),
+        layers=np.array(list(layers) if layers is not None else [-1]),
     )
 
 
@@ -175,12 +195,25 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument(
         "--what", nargs="+", choices=["speaker", "voxtral"], required=True
     )
+    parser.add_argument(
+        "--question", choices=sorted(VOXTRAL_QUESTIONS), default="grammar"
+    )
+    parser.add_argument("--layers", type=int, nargs="+")
     args = parser.parse_args(argv)
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    extractors = {"speaker": extract_speaker, "voxtral": extract_voxtral}
+
+    def voxtral(files: Sequence[Path], output: Path) -> None:
+        extract_voxtral(files, output, VOXTRAL_QUESTIONS[args.question], args.layers)
+
+    extractors = {"speaker": extract_speaker, "voxtral": voxtral}
     for what in args.what:
+        tag = (
+            what
+            if what == "speaker" or args.question == "grammar"
+            else (f"voxtral_{args.question}")
+        )
         for split in ("train", "test"):
-            output = args.output_dir / f"{what}_{split}.npz"
+            output = args.output_dir / f"{tag}_{split}.npz"
             if output.exists():
                 print("skip", output)
                 continue
