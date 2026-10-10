@@ -132,6 +132,7 @@ def extract_voxtral(
     output: Path,
     question: str = VOXTRAL_QUESTION,
     layers: Sequence[int] | None = None,
+    question_first: bool = False,
 ) -> None:
     """Save per-layer means of Voxtral states over the audio-token positions.
 
@@ -140,6 +141,11 @@ def extract_voxtral(
         output: Destination ``.npz``.
         question: Text question given to the model together with the audio.
         layers: Hidden-state indices to keep (all layers when ``None``).
+        question_first: Put the question before the audio. Voxtral reads left to
+            right, so the audio-token states depend on the question only when it
+            comes first; with the default order they are identical for every
+            question. The state of the final token, which has seen both, is
+            always saved as ``last``.
     """
     import torch
     from transformers import AutoProcessor, VoxtralForConditionalGeneration
@@ -149,13 +155,18 @@ def extract_voxtral(
         VOXTRAL_MODEL, torch_dtype=torch.float16, device_map={"": 0}
     ).eval()
     audio_token_id = model.config.audio_token_id
-    rows, counts = [], []
+    rows, lasts, counts = [], [], []
     started = time.time()
     for index, path in enumerate(files, start=1):
         conversation = [
             {
                 "role": "user",
                 "content": [
+                    {"type": "text", "text": question},
+                    {"type": "audio", "path": str(path)},
+                ]
+                if question_first
+                else [
                     {"type": "audio", "path": str(path)},
                     {"type": "text", "text": question},
                 ],
@@ -168,11 +179,15 @@ def extract_voxtral(
         positions = inputs["input_ids"][0] == audio_token_id
         if not bool(positions.any()):
             raise RuntimeError(f"No audio tokens found for {path.name}")
-        means = torch.stack(states)[:, 0][:, positions].float().mean(dim=1)
-        if not bool(torch.isfinite(means).all()):
+        stacked = torch.stack(states)[:, 0].float()  # [layers, tokens, dim]
+        means = stacked[:, positions].mean(dim=1)
+        last = stacked[:, -1]
+        if not bool(torch.isfinite(means).all() and torch.isfinite(last).all()):
             raise FloatingPointError(f"Non-finite Voxtral states for {path.name}")
         kept = means if layers is None else means[list(layers)]
         rows.append(kept.cpu().numpy().astype(np.float16))
+        kept_last = last if layers is None else last[list(layers)]
+        lasts.append(kept_last.cpu().numpy().astype(np.float16))
         counts.append(int(positions.sum()))
         if index % 50 == 0:
             rate = (time.time() - started) / index
@@ -181,6 +196,8 @@ def extract_voxtral(
         output,
         filenames=np.array([p.name for p in files]),
         mean=np.stack(rows),
+        last=np.stack(lasts),
+        question_first=np.array(question_first),
         audio_tokens=np.array(counts),
         question=np.array(question),
         layers=np.array(list(layers) if layers is not None else [-1]),
@@ -199,19 +216,26 @@ def main(argv: Sequence[str] | None = None) -> None:
         "--question", choices=sorted(VOXTRAL_QUESTIONS), default="grammar"
     )
     parser.add_argument("--layers", type=int, nargs="+")
+    parser.add_argument("--question-first", action="store_true")
     args = parser.parse_args(argv)
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     def voxtral(files: Sequence[Path], output: Path) -> None:
-        extract_voxtral(files, output, VOXTRAL_QUESTIONS[args.question], args.layers)
+        extract_voxtral(
+            files,
+            output,
+            VOXTRAL_QUESTIONS[args.question],
+            args.layers,
+            args.question_first,
+        )
 
     extractors = {"speaker": extract_speaker, "voxtral": voxtral}
     for what in args.what:
-        tag = (
-            what
-            if what == "speaker" or args.question == "grammar"
-            else (f"voxtral_{args.question}")
-        )
+        tag = what
+        if what == "voxtral" and (args.question != "grammar" or args.question_first):
+            tag = f"voxtral_{args.question}" + (
+                "_qfirst" if args.question_first else ""
+            )
         for split in ("train", "test"):
             output = args.output_dir / f"{tag}_{split}.npz"
             if output.exists():
